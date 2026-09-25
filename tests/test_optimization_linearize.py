@@ -6,10 +6,10 @@ Covers:
 - regression_range: automatic DN range (smallest DN to design DN plus one step)
 - merge_pipe_costs: every catalogue DN needs a cost
 - linearize_pipes: reference values, monotone costs, warnings, report
+- invest_cost / heat_loss: the linearised terms of the MILP
 
 The reference values (70/50 °C, street DN32 to KMR 150: a_K ≈ 0.123 €/(m·kW),
-b_K ≈ 640 €/m, R² ≈ 0.84, deviation −10 % to +13 %) come from the
-implementation plan and are only used as test references.
+b_K ≈ 640 €/m, R² ≈ 0.84, deviation −10 % to +13 %) are test references only.
 """
 from __future__ import annotations
 
@@ -23,6 +23,7 @@ from fheat_core.algorithms.network import calculate_glf, calculate_volumeflow
 from fheat_core.optimization import HOUSE_CONNECTION, STREET_PIPE
 from fheat_core.optimization.linearize import (
     fit_linear,
+    DesignLoads,
     linearize_pipes,
     merge_pipe_costs,
     pipe_capacities,
@@ -44,7 +45,12 @@ def pipe_costs():
 @pytest.fixture
 def reference(pipe_info, pipe_costs):
     """50 buildings à 50 kW at 70/50 °C → street range PEX 32 to KMR 150."""
-    return linearize_pipes(pipe_info, pipe_costs, [50.0] * 50, htemp=70, ltemp=50)
+    return linearize_pipes(pipe_info, pipe_costs, _loads([50.0] * 50), htemp=70, ltemp=50)
+
+
+def _loads(powers):
+    """Design loads with simultaneity: GLF(1) · max Q and GLF(N) · ΣQ."""
+    return DesignLoads(house=calculate_glf(1) * max(powers), street=calculate_glf(len(powers)) * sum(powers))
 
 
 # ---------------------------------------------------------------------------
@@ -203,27 +209,14 @@ class TestLinearizePipes:
         assert t.loc[dn, "actual"] * 8760 / 1000 == pytest.approx(loss_kwh)
 
     def test_soil_temperature_changes_losses(self, pipe_info, pipe_costs):
-        warm = linearize_pipes(pipe_info, pipe_costs, [50.0] * 50, 70, 50, soil_temperature=15.0)
-        cold = linearize_pipes(pipe_info, pipe_costs, [50.0] * 50, 70, 50, soil_temperature=5.0)
+        warm = linearize_pipes(pipe_info, pipe_costs, _loads([50.0] * 50), 70, 50, soil_temperature=15.0)
+        cold = linearize_pipes(pipe_info, pipe_costs, _loads([50.0] * 50), 70, 50, soil_temperature=5.0)
         assert warm.street_loss.intercept < cold.street_loss.intercept
         assert warm.soil_temperature == 15.0
 
-    def test_extra_insulation_lowers_losses(self, pipe_info, pipe_costs, reference):
-        extra = linearize_pipes(pipe_info, pipe_costs, [50.0] * 50, 70, 50, insulation="extra")
-        assert (extra.street_loss.table["actual"] <= reference.street_loss.table["actual"]).all()
-        assert extra.insulation == "extra"
-
-    def test_invalid_insulation_raises(self, pipe_info, pipe_costs):
-        with pytest.raises(ValueError, match="insulation"):
-            linearize_pipes(pipe_info, pipe_costs, [50.0], 70, 50, insulation="foam")
-
-    def test_empty_power_raises(self, pipe_info, pipe_costs):
-        with pytest.raises(ValueError, match="empty"):
-            linearize_pipes(pipe_info, pipe_costs, [], 70, 50)
-
-    def test_negative_power_raises(self, pipe_info, pipe_costs):
+    def test_negative_design_load_raises(self, pipe_info, pipe_costs):
         with pytest.raises(ValueError, match="negative"):
-            linearize_pipes(pipe_info, pipe_costs, [50.0, -1.0], 70, 50)
+            linearize_pipes(pipe_info, pipe_costs, DesignLoads(house=-1.0, street=100.0), 70, 50)
 
     def test_tighter_range_fits_better(self, pipe_info, pipe_costs, reference):
         """The automatic range beats a regression over the whole street catalogue."""
@@ -231,19 +224,18 @@ class TestLinearizePipes:
         full = fit_linear(merged["DN"], pipe_capacities(merged, 70, 50), merged["cost_eur_per_m"])
         assert reference.street_cost.max_abs_deviation < full.max_abs_deviation
 
-    def test_street_range_uses_glf_of_all_buildings(self, pipe_info, pipe_costs):
-        power = [100.0] * 20
-        lin = linearize_pipes(pipe_info, pipe_costs, power, 70, 50)
-        _, last, _ = regression_range(
-            pipe_info, STREET_PIPE, calculate_glf(20) * 2000.0, 70, 50
-        )
-        assert lin.street_cost.dn_range[1] == pipe_info["DN"].iloc[last]
+    def test_range_ends_follow_design_loads(self, pipe_info, pipe_costs):
+        loads = DesignLoads(house=40.0, street=1500.0)
+        lin = linearize_pipes(pipe_info, pipe_costs, loads, 70, 50)
+        for edge_type, fit in ((HOUSE_CONNECTION, lin.house_cost), (STREET_PIPE, lin.street_cost)):
+            _, last, _ = regression_range(pipe_info, edge_type, loads.of(edge_type), 70, 50)
+            assert fit.dn_range[1] == pipe_info["DN"].iloc[last]
 
 
 class TestLinearizeWarnings:
     def test_deviation_warning_logged_and_returned(self, pipe_info, pipe_costs, caplog):
         with caplog.at_level(logging.WARNING, logger="fheat_core.optimization.linearize"):
-            lin = linearize_pipes(pipe_info, pipe_costs, [50.0] * 50, 70, 50, max_deviation=0.05)
+            lin = linearize_pipes(pipe_info, pipe_costs, _loads([50.0] * 50), 70, 50, max_deviation=0.05)
         cost_warnings = [w for w in lin.warnings if w.startswith("cost regression (Straßenleitung")]
         assert len(cost_warnings) == 1
         assert "+13.0%" in cost_warnings[0]
@@ -253,13 +245,13 @@ class TestLinearizeWarnings:
         assert not [w for w in reference.warnings if w.startswith("cost regression")]
 
     def test_exceeding_largest_dn_warns(self, pipe_info, pipe_costs):
-        lin = linearize_pipes(pipe_info, pipe_costs, [1e6], 70, 50)
+        lin = linearize_pipes(pipe_info, pipe_costs, _loads([1e6]), 70, 50)
         assert any("exceeds the largest DN" in w for w in lin.warnings)
         assert lin.street_cost.dn_range[1] == pipe_info["DN"].iloc[-1]
 
     def test_fit_quality_logged(self, pipe_info, pipe_costs, caplog):
         with caplog.at_level(logging.INFO, logger="fheat_core.optimization.linearize"):
-            linearize_pipes(pipe_info, pipe_costs, [50.0] * 50, 70, 50)
+            linearize_pipes(pipe_info, pipe_costs, _loads([50.0] * 50), 70, 50)
         msgs = [r.getMessage() for r in caplog.records]
         assert sum("R²=" in m and "deviation per DN" in m for m in msgs) == 4
 

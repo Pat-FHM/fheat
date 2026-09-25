@@ -169,3 +169,23 @@ def _random_terminals(rng, mesh, candidates):
         buildings.append(((x + 3 + 0.01 * k, y + 4), (x, y), rng.uniform(5, 50)))
     x, y = rng.choice(mesh)
     return buildings, [((x - 7, y - 3), (x, y))]
+
+
+def two_cluster_case(n_per_cluster=50, power=100.0):
+    """Two clusters A and B with a direct feeder each or a shared trunk.
+
+    Source at S(0, 0); S-A and S-B are 90 m, the trunk S-J 60 m and the
+    branches J-A, J-B 50 m each. ``n_per_cluster`` buildings of ``power`` [kW]
+    are connected at A and at B. Returns the graph data and the node
+    coordinates {"S", "J", "A", "B"}.
+    """
+    x = (90 ** 2 - 50 ** 2 + 60 ** 2) / (2 * 60)
+    y = (90 ** 2 - x ** 2) ** 0.5
+    nodes = {"S": (0.0, 0.0), "J": (60.0, 0.0), "A": (x, y), "B": (x, -y)}
+    streets = [[nodes[p], nodes[q]] for p, q in (("S", "A"), ("S", "B"), ("S", "J"), ("J", "A"), ("J", "B"))]
+    buildings = [
+        ((cx + 0.5 * (i % 10) + 1, cy + sign * (1 + 0.5 * (i // 10))), (cx, cy), power)
+        for (cx, cy), sign in ((nodes["A"], 1), (nodes["B"], -1))
+        for i in range(n_per_cluster)
+    ]
+    return street_graph(streets, buildings, [((-5.0, 0.0), nodes["S"])]), nodes

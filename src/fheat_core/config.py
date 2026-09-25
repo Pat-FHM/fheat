@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import ClassVar
 
+from fheat_core.optimization import GLF_OFF, GLF_REFERENCE
+
 
 @dataclass
 class FHeatConfig:
@@ -54,11 +56,15 @@ class FHeatConfig:
 
 @dataclass
 class OptimizationConfig:
-    """Parameters of the MILP network optimisation (plan section 9).
+    """Parameters of the MILP network optimisation (``fheat_core.optimization``).
 
     The economic defaults are PLATZHALTER values from the literature and must
     be replaced by project-specific values.
     """
+
+    # Simultaneity in the route choice: "referenz" (exact on bridges,
+    # reference-tree GLF elsewhere) or "aus" (no GLF, same cost line, for comparison)
+    glf_mode: str = GLF_REFERENCE
 
     # Economics — PLATZHALTER, see sources
     interest_rate: float = 0.08              # Lambert et al. 2025 (internal rate of return)
@@ -67,18 +73,24 @@ class OptimizationConfig:
     lifetime_source: int = 20                # [a] Lambert et al. 2025, Tab. 7
     heat_cost_eur_per_kwh: float = 0.08      # [€/kWh] Lambert et al. 2024, Tab. 1
 
-    # Solver (HiGHS)
-    mip_rel_gap: float = 0.01
+    # Solver (HiGHS): stops at the absolute gap or the time limit only
     mip_abs_gap: float | str = "auto"        # [€/a]; "auto": 0.5 % of the pipe annuity of the shortest-path tree
     time_limit_s: float = 300.0
 
+    _ALLOWED_GLF_MODES: ClassVar[frozenset] = frozenset({GLF_REFERENCE, GLF_OFF})
+
     def __post_init__(self) -> None:
+        if self.glf_mode not in self._ALLOWED_GLF_MODES:
+            raise ValueError(
+                f"glf_mode '{self.glf_mode}' is not allowed. "
+                f"Allowed values: {sorted(self._ALLOWED_GLF_MODES)}"
+            )
         if self.interest_rate <= 0:
             raise ValueError(f"interest_rate ({self.interest_rate}) must be greater than 0.")
         for name in ("lifetime_pipes", "lifetime_source", "time_limit_s"):
             if getattr(self, name) <= 0:
                 raise ValueError(f"{name} ({getattr(self, name)}) must be greater than 0.")
-        for name in ("source_capex_eur_per_kw", "heat_cost_eur_per_kwh", "mip_rel_gap"):
+        for name in ("source_capex_eur_per_kw", "heat_cost_eur_per_kwh"):
             if getattr(self, name) < 0:
                 raise ValueError(f"{name} ({getattr(self, name)}) must not be negative.")
         if self.mip_abs_gap != "auto" and (

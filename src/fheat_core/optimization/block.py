@@ -1,27 +1,57 @@
-"""Pyomo block "netz": route, flow direction and capacity of every section (plan section 6).
+"""Pyomo block "netz": route, flow direction and capacity of every section.
 
-Forced mode: every reachable building is connected (x_k = 1). Symbols and
-constraint numbers as in plan section 6:
+MILP formulation, forced mode (every reachable building is connected).
 
-1. λ_ij + λ_ji = y_e: one pipe with one flow direction per section (R3)
-2. Σ_i λ_ij ≤ 1 at every junction j: radial network
-3. λ_(j→k) = 1 at every house connection
-4. count flow n: inflow − outflow = 1 at a building, 0 at a junction
-5. power flow S [kW]: inflow − outflow = Q_k at a building, 0 at a junction
-6. n_ij ≤ N · λ_ij and S_ij ≤ ΣQ · λ_ij: flow only in the built direction.
-   In addition λ_ij ≤ n_ij: every built pipe supplies at least one building.
-   This keeps the optimum and makes every feasible solution a tree, also one
-   the solver returns at the MIP gap or the time limit.
-7. C_e ≥ S_e (design capacity without simultaneity) and C_e ≤ Q_max · y_e [kW]
-8. heat loss_e = (a_V · C_e + b_V · y_e) · L_e / 1000 [kW]
+Sets
+    J junctions, K buildings, s the heat source (nodes of the simplified graph).
+    E sections e = {i, j}; A directed arcs i→j, A(e) the arcs of section e.
+    E_F ⊆ E bridges with a fixed direction: A(e) holds only that direction,
+    and in the forced mode they are built. Every other section has both arcs.
 
-Bridges with a fixed direction (plan section 5) must be built in the forced
-mode: only their fixed direction exists and y, λ are fixed to 1, so they need
-no binary decision. House connections are such bridges, which gives no. 3.
+Parameters
+    L_e [m] length; Q_k [kW] connection power of building k; N number of
+    buildings; ΣQ [kW] their summed power; Q_max [kW] capacity of the largest
+    DN; g_e simultaneity factor of section e (``glf_terms``); a_K [€/(m·kW)],
+    b_K [€/m], a_V [W/(m·kW)], b_V [W/m] linearised cost and loss per edge
+    type (``linearize``).
+
+Variables
+    y_e ∈ {0, 1}     section e built (fixed to 1 on E_F)
+    λ_ij ∈ {0, 1}    flow direction i→j (fixed to 1 on E_F)
+    n_ij ≥ 0         number of buildings supplied through i→j (count flow)
+    S_ij ≥ 0 [kW]    summed connection power supplied through i→j
+    C_e ≥ 0 [kW]     design capacity of section e
+
+Constraints
+    (1) Σ_{a ∈ A(e)} λ_a = y_e for e ∈ E, e ∉ E_F: one pipe with one direction.
+    (2) Σ_{i→j ∈ A} λ_ij ≤ 1 for j ∈ J: radial network.
+    (3) λ_(j→k) = 1 at every house connection (house connections are in E_F).
+    (4) Σ_in n − Σ_out n = 1 at k ∈ K and 0 at j ∈ J.
+    (5) Σ_in S − Σ_out S = Q_k at k ∈ K and 0 at j ∈ J [kW].
+    (6) n_ij ≤ N · λ_ij, S_ij ≤ ΣQ · λ_ij and λ_ij ≤ n_ij for i→j ∈ A.
+        The last inequality makes every built pipe supply at least one
+        building. It keeps the optimum and makes every feasible solution a
+        tree, also one returned at the MIP gap or the time limit.
+    (7) C_e = g_e · Σ_{a ∈ A(e)} S_a and C_e ≤ Q_max · y_e for e ∈ E [kW].
+        The equality fixes C also where a linearised slope is 0 (e.g. equal
+        costs of the two smallest DNs), so C never floats up to Q_max.
+    (8) loss_e = (a_V · C_e + b_V · y_e) · L_e / 1000 for e ∈ E [kW].
+
+Coupling with the oemof system (``energysystem``, one time step of 8760 h)
+    (9)  flow to the consumers = Σ_k W_k / 8760 and flow to the network
+         losses = Σ_e loss_e [kW], W_k [kWh/a] the annual heat demand.
+    (10) P ≥ C_(source connection) + Σ_e loss_e [kW], P the producer capacity.
+
+Objective [€/a]
+    min  ep · P + c · 8760 · F + an · Σ_e L_e · (a_K · C_e + b_K · y_e)
+    with F [kW] the producer flow (= both flows of (9) by the bus balance),
+    ep [€/(kW·a)] the annuity of the producer investment, c [€/kWh] the heat
+    cost and an [1/a] the annuity factor of the pipes.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Mapping
 
 from fheat_core import columns as cols
 from fheat_core.optimization import MISSING_OPT_EXTRA
@@ -115,12 +145,17 @@ class NetworkSets:
             )
 
 
-def build_network_block(network: SimplifiedNetwork, linearization: PipeLinearization) -> po.Block:
-    """Pyomo block with variables, constraints 1 to 8 and the cost expressions.
+def build_network_block(
+    network: SimplifiedNetwork,
+    linearization: PipeLinearization,
+    glf_factor: Mapping[tuple[int, int], float],
+) -> po.Block:
+    """Pyomo block with the variables and constraints (1) to (8).
 
-    Expressions for the energy system: ``heat_loss`` [kW] (sum of no. 8),
-    ``invest_cost`` [€] (pipe investment, linearised) and
-    ``source_capacity`` [kW] (C of the source connection).
+    ``glf_factor`` holds g_e per section (``glf_terms.glf_factors``).
+    Expressions for the energy system: ``heat_loss`` [kW] (sum of (8)),
+    ``invest_cost`` [€] (linearised pipe investment) and ``source_capacity``
+    [kW] (C of the source connection, used in (10)).
     """
     sets = NetworkSets.of(network, float(linearization.capacities["capacity"].max()))
     b = po.Block(concrete=True)
@@ -129,12 +164,13 @@ def build_network_block(network: SimplifiedNetwork, linearization: PipeLineariza
     _add_variables(b, sets)
     _add_direction_constraints(b, sets)
     _add_flow_constraints(b, sets)
-    _add_capacity_constraints(b, sets)
+    _add_capacity_constraints(b, sets, glf_factor)
     _add_expressions(b, sets, linearization)
     return b
 
 
 def _add_variables(b, sets):
+    """Variables; y and λ fixed to 1 on E_F."""
     b.built = po.Var(b.EDGES, domain=po.Binary)                   # y_e
     b.direction = po.Var(b.ARCS, domain=po.Binary)                # λ_ij
     b.count_flow = po.Var(b.ARCS, domain=po.NonNegativeReals)     # n_ij
@@ -147,7 +183,7 @@ def _add_variables(b, sets):
 
 
 def _add_direction_constraints(b, sets):
-    """Constraints 1 and 2."""
+    """Constraints (1) and (2)."""
     def one_direction(b, u, v):
         if (u, v) in sets.fixed_edges:
             return po.Constraint.Skip
@@ -163,7 +199,7 @@ def _add_direction_constraints(b, sets):
 
 
 def _add_flow_constraints(b, sets):
-    """Constraints 4 to 6."""
+    """Constraints (4) to (6)."""
     nodes = sets.junctions + list(sets.building_power)
 
     def count_balance(b, j):
@@ -189,10 +225,10 @@ def _add_flow_constraints(b, sets):
     )
 
 
-def _add_capacity_constraints(b, sets):
-    """Constraint 7 (without simultaneity)."""
+def _add_capacity_constraints(b, sets, glf_factor):
+    """Constraint (7)."""
     def design(b, u, v):
-        return b.capacity[u, v] >= sum(b.power_flow[a] for a in sets.arcs_of_edge[u, v])
+        return b.capacity[u, v] == glf_factor[u, v] * sum(b.power_flow[a] for a in sets.arcs_of_edge[u, v])
 
     b.capacity_design = po.Constraint(b.EDGES, rule=design)
     b.capacity_bound = po.Constraint(
@@ -201,7 +237,7 @@ def _add_capacity_constraints(b, sets):
 
 
 def _add_expressions(b, sets, linearization):
-    """Constraint 8 and the linearised pipe investment."""
+    """Constraint (8) and the linearised pipe investment."""
     def section_loss(b, u, v):
         e = (u, v)
         return linearization.heat_loss(sets.edge_type[e], sets.length[e], b.capacity[e], b.built[e])

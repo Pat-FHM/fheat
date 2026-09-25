@@ -1,10 +1,14 @@
-"""Linearisation of pipe costs and heat losses over the transport capacity (plan section 4).
+"""Linearisation of pipe costs and heat losses over the transport capacity.
 
 The MILP only knows a continuous design capacity C_e [kW] per section. Pipe
 costs and heat losses are therefore approximated per edge type by straight
-lines over the capacity of the catalogue DNs:
+lines over the capacity of the catalogue DNs (block.py, objective and (8)):
 
     cost [€/m] = a_K · Q + b_K        loss [W/m] = a_V · Q + b_V
+
+with Q_max = V̇_max · ρ · c_p · (T_VL − T_RL) per DN and the loss
+2 · U · (T_mean − T_soil) per trench metre, U the standard ``U-Value`` of the
+catalogue (as ``cols.HEAT_LOSS`` in ``compute_network``).
 
 The regression range is limited automatically to the DNs the network can
 actually need (smallest allowed DN up to the DN carrying the design load,
@@ -15,17 +19,28 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from typing import Iterable
 
 import numpy as np
 import pandas as pd
 
-from fheat_core.algorithms.network import calculate_glf, calculate_volumeflow
+from fheat_core.algorithms.network import calculate_volumeflow
 from fheat_core.optimization import HOUSE_CONNECTION, STREET_PIPE
 
 logger = logging.getLogger(__name__)
 
-_U_VALUE_COLUMNS = {"standard": "U-Value", "extra": "U-Value_extra_insulation"}
+
+@dataclass(frozen=True)
+class DesignLoads:
+    """Largest design load [kW] of a house connection and of a street pipe.
+
+    They set the end of the regression range of each edge type.
+    """
+
+    house: float
+    street: float
+
+    def of(self, edge_type: str) -> float:
+        return self.house if edge_type == HOUSE_CONNECTION else self.street
 
 
 def _start_index(edge_type: str) -> int:
@@ -75,7 +90,6 @@ class PipeLinearization:
     supply_temperature: float
     return_temperature: float
     soil_temperature: float
-    insulation: str
     max_deviation: float
     warnings: tuple[str, ...] = field(default_factory=tuple)
 
@@ -89,7 +103,7 @@ class PipeLinearization:
         return getattr(self, f"{prefix}_{quantity}")
 
     def invest_cost(self, edge_type: str, length, capacity, built):
-        """Pipe investment [€] of a section: L · (a_K · C + b_K · y) (plan section 6, objective).
+        """Pipe investment [€] of a section: L · (a_K · C + b_K · y) (block.py, objective).
 
         ``length`` [m], ``capacity`` C [kW], ``built`` y (0/1). Accepts numbers
         and Pyomo expressions.
@@ -98,7 +112,7 @@ class PipeLinearization:
         return length * (f.slope * capacity + f.intercept * built)
 
     def heat_loss(self, edge_type: str, length, capacity, built):
-        """Heat loss [kW] of a section: (a_V · C + b_V · y) · L / 1000 (plan section 6, no. 8).
+        """Heat loss [kW] of a section: (a_V · C + b_V · y) · L / 1000 (block.py, (8)).
 
         ``length`` [m], ``capacity`` C [kW], ``built`` y (0/1). Accepts numbers
         and Pyomo expressions.
@@ -198,12 +212,11 @@ def merge_pipe_costs(pipe_info: pd.DataFrame, pipe_costs: pd.DataFrame) -> pd.Da
 def linearize_pipes(
     pipe_info: pd.DataFrame,
     pipe_costs: pd.DataFrame,
-    thermal_power: Iterable[float],
+    design_loads: DesignLoads,
     htemp: float,
     ltemp: float,
     soil_temperature: float = 10.0,
     max_deviation: float = 0.15,
-    insulation: str = "standard",
 ) -> PipeLinearization:
     """Linearise pipe costs and heat losses for house connections and street pipes.
 
@@ -213,10 +226,8 @@ def linearize_pipes(
         Pipe catalogue (``load_pipe_info()`` or adapter), sorted by capacity.
     pipe_costs
         Cost table with ``DN`` and ``cost_eur_per_m`` [€ per trench metre].
-    thermal_power
-        Connection power [kW] of every building that may be connected. The
-        street range ends at the DN carrying GLF(N) · ΣQ, the house connection
-        range at the DN carrying GLF(1) · max(Q) (each plus one step).
+    design_loads
+        Largest design load [kW] per edge type, see ``glf_terms.design_loads``.
     htemp, ltemp
         Supply and return temperature [°C].
     soil_temperature
@@ -224,60 +235,18 @@ def linearize_pipes(
     max_deviation
         A warning is issued for every fit whose relative deviation at one DN
         exceeds this value.
-    insulation
-        ``"standard"`` (``U-Value``) or ``"extra"`` (``U-Value_extra_insulation``).
     """
-    if insulation not in _U_VALUE_COLUMNS:
-        raise ValueError(
-            f"insulation '{insulation}' is not allowed. Allowed values: {sorted(_U_VALUE_COLUMNS)}"
-        )
-    power = np.asarray(list(thermal_power), dtype=float)
-    if power.size == 0:
-        raise ValueError("thermal_power is empty: at least one building is required.")
-    if (power < 0).any():
-        raise ValueError("thermal_power must not be negative.")
-
-    catalogue = merge_pipe_costs(pipe_info, pipe_costs).reset_index(drop=True)
-    catalogue["capacity"] = pipe_capacities(catalogue, htemp, ltemp)
-    t_mean = (htemp + ltemp) / 2
-    catalogue["loss_w_per_m"] = 2 * catalogue[_U_VALUE_COLUMNS[insulation]] * (t_mean - soil_temperature)
-
-    design = {
-        HOUSE_CONNECTION: calculate_glf(1) * float(power.max()),
-        STREET_PIPE: calculate_glf(power.size) * float(power.sum()),
-    }
-
+    if min(design_loads.house, design_loads.street) < 0:
+        raise ValueError(f"Design loads must not be negative: {design_loads}.")
+    catalogue = _catalogue(pipe_info, pipe_costs, htemp, ltemp, soil_temperature)
     fits: dict[tuple[str, str], LinearFit] = {}
     warnings: list[str] = []
-    for edge_type, design_power in design.items():
-        first, last, exceeded = regression_range(catalogue, edge_type, design_power, htemp, ltemp)
-        if exceeded:
-            msg = (
-                f"{edge_type}: design load {design_power:.1f} kW exceeds the largest DN "
-                f"{catalogue['DN'].iloc[-1]} ({catalogue['capacity'].iloc[-1]:.1f} kW)."
-            )
-            logger.warning(msg)
-            warnings.append(msg)
-        rows = catalogue.iloc[first:last + 1]
+    for edge_type in (HOUSE_CONNECTION, STREET_PIPE):
+        rows = _regression_rows(catalogue, edge_type, design_loads.of(edge_type), htemp, ltemp, warnings)
         for quantity, column in (("cost", "cost_eur_per_m"), ("loss", "loss_w_per_m")):
             f = fit_linear(rows["DN"], rows["capacity"], rows[column])
             fits[(quantity, edge_type)] = f
-            lo, hi = f.dn_range
-            logger.info(
-                "Linearised %s (%s, %s to %s): slope=%.6g, intercept=%.6g, R²=%.3f, "
-                "deviation per DN: %s",
-                quantity, edge_type, lo, hi, f.slope, f.intercept, f.r_squared,
-                ", ".join(f"{d}: {v:+.1%}" for d, v in zip(f.table["DN"], f.table["deviation"], strict=True)),
-            )
-            if f.max_abs_deviation > max_deviation:
-                worst = f.table.loc[f.table["deviation"].abs().idxmax()]
-                msg = (
-                    f"{quantity} regression ({edge_type}, {lo} to {hi}) deviates by "
-                    f"{worst['deviation']:+.1%} at {worst['DN']} "
-                    f"(limit ±{max_deviation:.0%})."
-                )
-                logger.warning(msg)
-                warnings.append(msg)
+            _log_fit(f, quantity, edge_type, max_deviation, warnings)
 
     return PipeLinearization(
         house_cost=fits[("cost", HOUSE_CONNECTION)],
@@ -288,7 +257,47 @@ def linearize_pipes(
         supply_temperature=htemp,
         return_temperature=ltemp,
         soil_temperature=soil_temperature,
-        insulation=insulation,
         max_deviation=max_deviation,
         warnings=tuple(warnings),
     )
+
+
+def _catalogue(pipe_info, pipe_costs, htemp, ltemp, soil_temperature) -> pd.DataFrame:
+    """Catalogue with cost [€/m], capacity Q_max [kW] and loss [W/m] per DN."""
+    catalogue = merge_pipe_costs(pipe_info, pipe_costs).reset_index(drop=True)
+    catalogue["capacity"] = pipe_capacities(catalogue, htemp, ltemp)
+    t_mean = (htemp + ltemp) / 2
+    catalogue["loss_w_per_m"] = 2 * catalogue["U-Value"] * (t_mean - soil_temperature)
+    return catalogue
+
+
+def _regression_rows(catalogue, edge_type, design_power, htemp, ltemp, warnings) -> pd.DataFrame:
+    first, last, exceeded = regression_range(catalogue, edge_type, design_power, htemp, ltemp)
+    if exceeded:
+        msg = (
+            f"{edge_type}: design load {design_power:.1f} kW exceeds the largest DN "
+            f"{catalogue['DN'].iloc[-1]} ({catalogue['capacity'].iloc[-1]:.1f} kW)."
+        )
+        logger.warning(msg)
+        warnings.append(msg)
+    return catalogue.iloc[first:last + 1]
+
+
+def _log_fit(f, quantity, edge_type, max_deviation, warnings):
+    """Log R² and the deviation per DN; warn above ``max_deviation``."""
+    lo, hi = f.dn_range
+    logger.info(
+        "Linearised %s (%s, %s to %s): slope=%.6g, intercept=%.6g, R²=%.3f, "
+        "deviation per DN: %s",
+        quantity, edge_type, lo, hi, f.slope, f.intercept, f.r_squared,
+        ", ".join(f"{d}: {v:+.1%}" for d, v in zip(f.table["DN"], f.table["deviation"], strict=True)),
+    )
+    if f.max_abs_deviation > max_deviation:
+        worst = f.table.loc[f.table["deviation"].abs().idxmax()]
+        msg = (
+            f"{quantity} regression ({edge_type}, {lo} to {hi}) deviates by "
+            f"{worst['deviation']:+.1%} at {worst['DN']} "
+            f"(limit ±{max_deviation:.0%})."
+        )
+        logger.warning(msg)
+        warnings.append(msg)

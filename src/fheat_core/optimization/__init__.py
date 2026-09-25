@@ -10,6 +10,10 @@ MISSING_OPT_EXTRA = (
     '(oemof.solph, HiGHS): pip install "fheat[opt]"'
 )
 
+# Simultaneity in the design capacity, see ``glf_terms``.
+GLF_REFERENCE = "referenz"   # exact GLF on bridges, reference-tree GLF elsewhere
+GLF_OFF = "aus"              # no simultaneity (C ≥ S), for comparison
+
 # Edge types (``cols.TYPE``) as set by ``fheat_core.algorithms.network``.
 HOUSE_CONNECTION = "Hausanschluss"
 STREET_PIPE = "Straßenleitung"

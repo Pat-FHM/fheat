@@ -1,8 +1,7 @@
-"""Graph simplification for the MILP network optimisation (plan section 5).
+"""Graph simplification for the MILP network optimisation.
 
 The street graph of ``steps/network.py`` has one node per street vertex. This
-module turns it into the candidate graph of the MILP. Numbering as in plan
-section 5:
+module turns it into the candidate graph of the MILP (block.py) in seven steps:
 
 1. Integer node IDs (Pyomo cannot index by coordinate tuples); the mapping
    ID ↔ coordinate is kept.
@@ -14,7 +13,7 @@ section 5:
 3. Chains of street nodes with exactly two street edges and no connection are
    merged into one edge per street section (summed length, joined geometry).
 4. Parallel sections between the same two nodes are reduced to the shortest
-   one (R3); self-loops created by step 3 are removed.
+   one (one pipe per section); self-loops created by step 3 are removed.
 5. Bridges are identified. For every bridge the side without a source is
    known, hence also the flow direction and the buildings behind it. With
    all buildings connected (forced mode) number and power behind a bridge
@@ -141,7 +140,7 @@ def simplify_network(
     power_att: str = cols.THERMAL_POWER,
     on_unreachable: str = "warn",
 ) -> SimplifiedNetwork:
-    """Simplify the street graph built by ``steps/network.py`` (plan section 5).
+    """Simplify the street graph built by ``steps/network.py`` (steps 1 to 7 above).
 
     Buildings are identified by their centroid (as in ``compute_network``),
     sources by their point geometry. ``G`` is not modified.

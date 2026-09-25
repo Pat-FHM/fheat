@@ -1,4 +1,4 @@
-"""Tests for fheat_core.optimization.block and .energysystem (forced mode, no GLF).
+"""Tests for fheat_core.optimization.block and .energysystem (forced mode).
 
 Covers:
 - T3 no double use: one flow direction per built section, one capacity and
@@ -8,7 +8,11 @@ Covers:
   are reported
 - T7 energy balance: producer = demand + losses; producer capacity covers
   the source connection plus losses
-- objective terms, fixed bridges, mip_abs_gap "auto", time limit, errors
+- simultaneity: C = g · S per section, producer sized with GLF(N) · ΣQ
+- T6 the GLF changes the route: two clusters get separate feeders without
+  GLF and a shared trunk with GLF (variant B)
+- objective terms, fixed bridges, mip_abs_gap "auto" (only absolute gap),
+  time limit, errors
 """
 from __future__ import annotations
 
@@ -27,29 +31,30 @@ from fheat_core.algorithms.network import (  # noqa: E402
     calculate_volumeflow,
 )
 from fheat_core.config import OptimizationConfig  # noqa: E402
-from fheat_core.optimization import HOUSE_CONNECTION  # noqa: E402
+from fheat_core.algorithms.network import calculate_glf  # noqa: E402
+from fheat_core.optimization import GLF_OFF, GLF_REFERENCE, HOUSE_CONNECTION  # noqa: E402
 from fheat_core.optimization.energysystem import (  # noqa: E402
     HOURS_PER_YEAR,
     MIP_ABS_GAP_AUTO_SHARE,
     solve_network,
 )
-from fheat_core.optimization.glf_terms import reference_tree  # noqa: E402
+from fheat_core.optimization.glf_terms import design_loads, glf_factors, reference_tree  # noqa: E402
 from fheat_core.optimization.linearize import linearize_pipes  # noqa: E402
 from fheat_core.optimization.preprocess import POWER, simplify_network  # noqa: E402
 from fheat_core.resources import load_pipe_costs, load_pipe_info  # noqa: E402
 
-from tests.optimization_graphs import grid_case, random_case, street_graph  # noqa: E402
+from tests.optimization_graphs import grid_case, random_case, street_graph, two_cluster_case  # noqa: E402
 
 FULL_LOAD_HOURS = 2000.0
 HTEMP, LTEMP = 80.0, 50.0
 
 
-def _solve(G, b, s, **config):
+def _solve(G, b, s, htemp=HTEMP, ltemp=LTEMP, **config):
+    cfg = OptimizationConfig(**config)
     net = simplify_network(G, b, s)
-    powers = [net.graph.nodes[n][POWER] for n in net.building_nodes.values()]
-    lin = linearize_pipes(load_pipe_info(), load_pipe_costs(), powers, HTEMP, LTEMP)
+    lin = linearize_pipes(load_pipe_info(), load_pipe_costs(), design_loads(net), htemp, ltemp)
     demand = {k: b.at[k, cols.THERMAL_POWER] * FULL_LOAD_HOURS for k in b.index}
-    return net, lin, solve_network(net, lin, demand, OptimizationConfig(**config))
+    return net, lin, solve_network(net, lin, demand, cfg)
 
 
 def _built_tree(res) -> nx.DiGraph:
@@ -57,15 +62,14 @@ def _built_tree(res) -> nx.DiGraph:
     return nx.DiGraph(list(zip(built["flow_from"], built["flow_to"], strict=True)))
 
 
-@pytest.fixture(scope="module")
-def mesh():
+def _mesh_graph():
     """Mesh A(0,0)-B(10,0)-C(10,10)-D(0,10) with a spur at D.
 
     A-B, B-C 10 m; A-D, D-C 50 m. Source at A, building 0 at C (30 kW),
     building 1 at the end of the spur D-(−10,20) (20 kW). Optimal: A-B-C and A-D.
     """
     dx = math.sqrt(25 ** 2 - 5 ** 2)
-    G, b, s = street_graph(
+    return street_graph(
         streets=[
             [(0, 0), (10, 0)], [(10, 0), (10, 10)],
             [(0, 0), (-dx, 5), (0, 10)], [(0, 10), (5, 10 + dx), (10, 10)],
@@ -74,8 +78,16 @@ def mesh():
         buildings=[((15, 10), (10, 10), 30.0), ((-10, 25), (-10, 20), 20.0)],
         sources=[((-5, 0), (0, 0))],
     )
-    net, lin, res = _solve(G, b, s)
-    return net, lin, res
+
+
+@pytest.fixture(scope="module")
+def mesh():
+    return _solve(*_mesh_graph())
+
+
+@pytest.fixture(scope="module")
+def mesh_without_glf():
+    return _solve(*_mesh_graph(), glf_mode=GLF_OFF)
 
 
 def _random_solved(seed):
@@ -91,7 +103,8 @@ class TestMeshOptimum:
     def test_optimal(self, mesh):
         _, _, res = mesh
         assert res.termination == "optimal"
-        assert res.best_bound == pytest.approx(res.objective, rel=OptimizationConfig().mip_rel_gap)
+        assert res.glf_mode == OptimizationConfig().glf_mode
+        assert res.achieved_gap <= res.mip_abs_gap + 1e-6
 
     def test_runtimes_reported(self, mesh):
         _, _, res = mesh
@@ -108,12 +121,26 @@ class TestMeshOptimum:
             frozenset(((0, 10), (-10, 20))),   # spur
         }
 
-    def test_capacity_equals_power_without_glf(self, mesh):
-        _, _, res = mesh
+    def test_capacity_equals_power_without_glf(self, mesh_without_glf):
+        _, _, res = mesh_without_glf
         built = res.edges[res.edges["built"]]
+        assert (built["glf_model"] == 1.0).all()
         assert built["capacity"].to_numpy() == pytest.approx(built[cols.THERMAL_POWER].to_numpy())
         src = res.edges[res.edges[cols.TYPE] == "Quellenanschluss"].iloc[0]
         assert (src["capacity"], src[cols.N_BUILDINGS]) == (pytest.approx(50.0), pytest.approx(2))
+
+    def test_capacity_with_glf(self, mesh):
+        _, _, res = mesh
+        built = res.edges[res.edges["built"]]
+        assert built["capacity"].to_numpy() == pytest.approx(
+            (built["glf_model"] * built[cols.THERMAL_POWER]).to_numpy()
+        )
+        src = res.edges[res.edges[cols.TYPE] == "Quellenanschluss"].iloc[0]
+        assert src["glf_model"] == pytest.approx(calculate_glf(2))
+        assert res.source_capacity == pytest.approx(calculate_glf(2) * 50.0 + res.loss_flow)
+
+    def test_glf_lowers_producer_capacity(self, mesh, mesh_without_glf):
+        assert mesh[2].source_capacity < mesh_without_glf[2].source_capacity
 
     def test_objective_parts(self, mesh):
         _, lin, res = mesh
@@ -138,8 +165,9 @@ class TestMeshOptimum:
         net, lin, res = mesh
         cfg = OptimizationConfig()
         tree = reference_tree(net)
+        g = glf_factors(net, tree, cfg.glf_mode)
         invest = sum(
-            lin.invest_cost(net.graph.edges[e][cols.TYPE], net.graph.edges[e][cols.LENGTH], s0, 1)
+            lin.invest_cost(net.graph.edges[e][cols.TYPE], net.graph.edges[e][cols.LENGTH], g[e] * s0, 1)
             for e, s0 in tree.s0.items()
         )
         pipe_annuity = economics.annuity(1.0, cfg.lifetime_pipes, cfg.interest_rate)
@@ -149,6 +177,34 @@ class TestMeshOptimum:
         G, b, s = random_case(3)
         _, _, res = _solve(G, b, s, mip_abs_gap=123.0)
         assert res.mip_abs_gap == 123.0
+
+
+# ---------------------------------------------------------------------------
+# T6: the GLF changes the route
+# ---------------------------------------------------------------------------
+
+
+class TestT6GlfChangesRoute:
+    """Two clusters of 50 buildings à 100 kW; feeders 90 m, trunk 60 m, branches 50 m.
+
+    At 70/50 °C. The outcome depends on the cost line: at 80/50 °C the line is
+    flatter (larger Q_max per DN) and the trunk is cheaper even without GLF.
+    """
+
+    @staticmethod
+    def _built_streets(glf_mode):
+        (G, b, s), nodes = two_cluster_case()
+        net, _, res = _solve(G, b, s, htemp=70.0, ltemp=50.0, glf_mode=glf_mode)
+        name = {frozenset((nodes[p], nodes[q])): p + q for p in nodes for q in nodes if p < q}
+        built = res.edges[res.edges["built"] & (res.edges[cols.TYPE] == "Straßenleitung")]
+        return {name[frozenset((net.node_coords[u], net.node_coords[v]))]
+                for u, v in zip(built["u"], built["v"], strict=True)}
+
+    def test_separate_feeders_without_glf(self):
+        assert self._built_streets(GLF_OFF) == {"AS", "BS"}
+
+    def test_shared_trunk_with_glf(self):
+        assert self._built_streets(GLF_REFERENCE) == {"JS", "AJ", "BJ"}
 
 
 # ---------------------------------------------------------------------------
@@ -194,7 +250,8 @@ class TestRandomNetworks:
         assert res.loss_flow == pytest.approx(res.edges["heat_loss"].sum())
         src = res.edges[res.edges[cols.TYPE] == "Quellenanschluss"].iloc[0]
         assert res.source_capacity == pytest.approx(src["capacity"] + res.loss_flow)
-        assert src["capacity"] == pytest.approx(powers)
+        n = len(net.building_nodes)
+        assert src["capacity"] == pytest.approx(calculate_glf(n) * powers)
 
     def test_fixed_bridges(self, seed):
         net, _, res = _random_solved(seed)
@@ -215,7 +272,7 @@ class TestSolver:
         """A grid without gap tolerance cannot be solved in 2 s; HiGHS stops at 2 s."""
         G, b, s = grid_case(5, 100, seed=1)
         with caplog.at_level("WARNING", logger="fheat_core.optimization.energysystem"):
-            _, _, res = _solve(G, b, s, mip_rel_gap=0.0, mip_abs_gap=0.0, time_limit_s=2.0)
+            _, _, res = _solve(G, b, s, mip_abs_gap=0.0, time_limit_s=2.0)
         assert res.termination == "maxTimeLimit"
         assert res.solve_time_s < 2.0 + 1.5
         assert res.best_bound < res.objective
