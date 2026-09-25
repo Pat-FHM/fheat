@@ -2,6 +2,7 @@
 
 Covers the bundled-data loaders:
 - load_pipe_info: returns the pipe catalogue used by network sizing
+- load_pipe_costs: pipe cost table (PLATZHALTER values) matching the catalogue
 - load_default_temperature: 8760-hour outdoor temperature series
 - load_default_holidays: dict[date → name]; falls back to {} if workalendar
   is missing.
@@ -17,6 +18,7 @@ import pytest
 from fheat_core.resources import (
     load_default_holidays,
     load_default_temperature,
+    load_pipe_costs,
     load_pipe_info,
 )
 
@@ -65,6 +67,36 @@ class TestLoadPipeInfo:
         assert vel > 0
         assert loss > 0
         assert 0 <= loss_extra <= loss
+
+
+# ---------------------------------------------------------------------------
+# load_pipe_costs
+# ---------------------------------------------------------------------------
+
+
+class TestLoadPipeCosts:
+    def test_required_columns(self):
+        df = load_pipe_costs()
+        assert list(df.columns) == ["DN", "cost_eur_per_m", "source", "note"]
+
+    def test_covers_pipe_catalogue(self):
+        """Every DN of the bundled catalogue has exactly one cost entry."""
+        costs = load_pipe_costs()
+        assert sorted(costs["DN"]) == sorted(load_pipe_info()["DN"])
+        assert not costs["DN"].duplicated().any()
+
+    def test_costs_positive(self):
+        assert (load_pipe_costs()["cost_eur_per_m"] > 0).all()
+
+    def test_all_values_marked_as_placeholder(self):
+        df = load_pipe_costs()
+        assert df["note"].str.startswith("PLATZHALTER").all()
+        assert df["source"].str.contains("Lambert et al. 2025").all()
+
+    def test_pex20_adopts_dn25_value(self):
+        df = load_pipe_costs().set_index("DN")
+        assert df.loc["PEX 20", "cost_eur_per_m"] == df.loc["PEX 25", "cost_eur_per_m"]
+        assert "DN25" in df.loc["PEX 20", "note"]
 
 
 # ---------------------------------------------------------------------------

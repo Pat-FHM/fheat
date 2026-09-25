@@ -19,6 +19,19 @@ def load_pipe_info() -> pd.DataFrame:
         return pd.read_csv(p)
 
 
+def load_pipe_costs() -> pd.DataFrame:
+    """Load the pipe cost table from the core default.
+
+    Columns: DN, cost_eur_per_m, source, note
+
+    ``DN`` matches the labels in ``pipe_data.csv``. Costs are per trench metre
+    (supply and return pipe together). All bundled values are marked
+    ``PLATZHALTER`` in ``note`` and must be replaced by project-specific costs.
+    """
+    with importlib.resources.as_file(_data_path("pipe_costs.csv")) as p:
+        return pd.read_csv(p)
+
+
 def load_default_temperature() -> pd.Series:
     """8760 hourly outdoor temperatures [°C] from the core example year."""
     with importlib.resources.as_file(_data_path("example_temperature.csv")) as p:

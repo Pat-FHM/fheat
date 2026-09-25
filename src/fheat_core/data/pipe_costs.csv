@@ -1,0 +1,15 @@
+DN,cost_eur_per_m,source,note
+PEX 20,540,"Lambert et al. 2025, Adv. Appl. Energy 20, 100251, Table 8 (data from Ceruti et al.)",PLATZHALTER; no DN20 value in source - DN25 value adopted
+PEX 25,540,"Lambert et al. 2025, Adv. Appl. Energy 20, 100251, Table 8 (data from Ceruti et al.)",PLATZHALTER; source value DN25
+PEX 32,575,"Lambert et al. 2025, Adv. Appl. Energy 20, 100251, Table 8 (data from Ceruti et al.)",PLATZHALTER; source value DN32
+PEX 40,590,"Lambert et al. 2025, Adv. Appl. Energy 20, 100251, Table 8 (data from Ceruti et al.)",PLATZHALTER; source value DN40
+PEX 50,660,"Lambert et al. 2025, Adv. Appl. Energy 20, 100251, Table 8 (data from Ceruti et al.)",PLATZHALTER; source value DN50
+PEX 65,680,"Lambert et al. 2025, Adv. Appl. Energy 20, 100251, Table 8 (data from Ceruti et al.)",PLATZHALTER; source value DN65
+PEX 80,800,"Lambert et al. 2025, Adv. Appl. Energy 20, 100251, Table 8 (data from Ceruti et al.)",PLATZHALTER; source value DN80
+PEX 100,820,"Lambert et al. 2025, Adv. Appl. Energy 20, 100251, Table 8 (data from Ceruti et al.)",PLATZHALTER; source value DN100 - same value used for PEX 100 and KMR 100
+KMR 100,820,"Lambert et al. 2025, Adv. Appl. Energy 20, 100251, Table 8 (data from Ceruti et al.)",PLATZHALTER; source value DN100 - same value used for PEX 100 and KMR 100
+KMR 125,945,"Lambert et al. 2025, Adv. Appl. Energy 20, 100251, Table 8 (data from Ceruti et al.)",PLATZHALTER; source value DN125
+KMR 150,1000,"Lambert et al. 2025, Adv. Appl. Energy 20, 100251, Table 8 (data from Ceruti et al.)",PLATZHALTER; source value DN150
+KMR 200,1380,"Lambert et al. 2025, Adv. Appl. Energy 20, 100251, Table 8 (data from Ceruti et al.)",PLATZHALTER; source value DN200
+KMR 250,1535,"Lambert et al. 2025, Adv. Appl. Energy 20, 100251, Table 8 (data from Ceruti et al.)",PLATZHALTER; source value DN250
+KMR 300,1645,"Lambert et al. 2025, Adv. Appl. Energy 20, 100251, Table 8 (data from Ceruti et al.)",PLATZHALTER; source value DN300

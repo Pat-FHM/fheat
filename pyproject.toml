@@ -41,6 +41,7 @@ nrw = ["owslib>=0.29", "lxml>=4.9"]         # NRW auto-download adapter (WFS + Z
 holidays = ["workalendar>=17.0"]           # German public holidays for the SLP load profile
 excel = ["openpyxl>=3.1"]                  # only for writing .xlsx in the examples (pd.ExcelWriter)
 full = ["owslib>=0.29", "lxml>=4.9", "workalendar>=17.0"]
+opt = ["oemof.solph>=0.6.5", "highspy"]      # optional MILP network optimisation (network_method = "milp")
 dev = ["pytest>=7.0", "build>=1.0", "twine>=5.0"]
 
 [project.urls]
