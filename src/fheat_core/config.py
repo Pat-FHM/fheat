@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import ClassVar
+from typing import ClassVar, Optional
 
-from fheat_core.optimization import GLF_OFF, GLF_REFERENCE
+from fheat_core.optimization import GLF_OFF, GLF_REFERENCE, ON_UNREACHABLE
 
 
 @dataclass
@@ -18,6 +18,8 @@ class FHeatConfig:
     # Network parameters
     supply_temperature: float = 80.0
     return_temperature: float = 50.0
+    network_method: str = "shortest_path"   # "shortest_path" (Dijkstra) or "milp" (needs extra [opt])
+    optimization: Optional[OptimizationConfig] = None   # "milp" only; None → defaults
 
     # WLD / suitability polygons
     wld_threshold: float = 500.0
@@ -34,6 +36,7 @@ class FHeatConfig:
     output_language: str = "de"  # "de" = German column labels, "raw" = canonical IDs
 
     _ALLOWED_FORMATS: ClassVar[frozenset] = frozenset({"gpkg", "fgb", "geojson", "gml"})
+    _ALLOWED_NETWORK_METHODS: ClassVar[frozenset] = frozenset({"shortest_path", "milp"})
     _ALLOWED_LANGUAGES: ClassVar[frozenset] = frozenset({"de", "raw"})
 
     def __post_init__(self) -> None:
@@ -52,6 +55,13 @@ class FHeatConfig:
                 f"output_language '{self.output_language}' is not allowed. "
                 f"Allowed values: {sorted(self._ALLOWED_LANGUAGES)}"
             )
+        if self.network_method not in self._ALLOWED_NETWORK_METHODS:
+            raise ValueError(
+                f"network_method '{self.network_method}' is not allowed. "
+                f"Allowed values: {sorted(self._ALLOWED_NETWORK_METHODS)}"
+            )
+        if self.network_method == "milp" and self.optimization is None:
+            self.optimization = OptimizationConfig()
 
 
 @dataclass
@@ -73,17 +83,32 @@ class OptimizationConfig:
     lifetime_source: int = 20                # [a] Lambert et al. 2025, Tab. 7
     heat_cost_eur_per_kwh: float = 0.08      # [€/kWh] Lambert et al. 2024, Tab. 1
 
+    # Pre-processing
+    soil_temperature: float = 10.0           # [°C] heat loss 2 · U · (T_mean − T_soil), as F|Heat
+    regression_max_deviation: float = 0.15   # warn if a cost/loss line deviates more at one DN
+    on_unreachable: str = "warn"             # buildings without a route to the source: "warn" | "error"
+
     # Solver (HiGHS): stops at the absolute gap or the time limit only
     mip_abs_gap: float | str = "auto"        # [€/a]; "auto": 0.5 % of the pipe annuity of the shortest-path tree
     time_limit_s: float = 300.0
 
     _ALLOWED_GLF_MODES: ClassVar[frozenset] = frozenset({GLF_REFERENCE, GLF_OFF})
+    _ALLOWED_ON_UNREACHABLE: ClassVar[frozenset] = ON_UNREACHABLE
 
     def __post_init__(self) -> None:
         if self.glf_mode not in self._ALLOWED_GLF_MODES:
             raise ValueError(
                 f"glf_mode '{self.glf_mode}' is not allowed. "
                 f"Allowed values: {sorted(self._ALLOWED_GLF_MODES)}"
+            )
+        if self.on_unreachable not in self._ALLOWED_ON_UNREACHABLE:
+            raise ValueError(
+                f"on_unreachable '{self.on_unreachable}' is not allowed. "
+                f"Allowed values: {sorted(self._ALLOWED_ON_UNREACHABLE)}"
+            )
+        if self.regression_max_deviation <= 0:
+            raise ValueError(
+                f"regression_max_deviation ({self.regression_max_deviation}) must be greater than 0."
             )
         if self.interest_rate <= 0:
             raise ValueError(f"interest_rate ({self.interest_rate}) must be greater than 0.")

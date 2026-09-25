@@ -31,6 +31,9 @@ FLOOR_AREA = "floor_area"            # net floor area [m²]
 AGE = "age"
 CONSTRUCTION_CLASS = "construction_class"  # construction age class (BAK)
 
+# pipeline output (network_method = "milp")
+CONNECTION_STATUS = "connection_status"    # "angeschlossen" / "nicht erreichbar"
+
 
 # ============================================================
 # Streets — input columns
@@ -71,6 +74,13 @@ VELOCITY = "velocity"                # flow velocity [m/s]
 HEAT_LOSS = "heat_loss"              # heat loss [kWh/a]
 HEAT_LOSS_EXTRA_INSULATION = "heat_loss_extra_insulation"  # heat loss with extra insulation [kWh/a]
 GLF = "glf"                          # simultaneity factor
+
+# optional, network_method = "milp": model values next to the post-calculation
+CAPACITY_MODEL = "capacity_model"        # design capacity in the MILP [kW]
+GLF_MODEL = "glf_model"                  # simultaneity factor used in the MILP
+INVEST_COST_MODEL = "invest_cost_model"  # linearised pipe investment of the MILP [€]
+INVEST_COST = "invest_cost"              # pipe investment of the chosen DN [€]
+ANNUAL_COST = "annual_cost"              # annuity of the pipe investment [€/a]
 
 
 # ============================================================
@@ -113,6 +123,10 @@ UNITS: dict[str, str] = {
     VELOCITY: "m/s",
     HEAT_LOSS: "kWh/a",
     HEAT_LOSS_EXTRA_INSULATION: "kWh/a",
+    CAPACITY_MODEL: "kW",
+    INVEST_COST_MODEL: "€",
+    INVEST_COST: "€",
+    ANNUAL_COST: "€/a",
 }
 
 
@@ -136,6 +150,7 @@ LABELS_DE: dict[str, str] = {
     FLOOR_AREA: "NF [m²]",
     AGE: "Alter",
     CONSTRUCTION_CLASS: "BAK",
+    CONNECTION_STATUS: "Anschlussstatus",
     # Streets
     ROUTABLE: "Moegliche_Route",
     # WLD
@@ -157,6 +172,11 @@ LABELS_DE: dict[str, str] = {
     HEAT_LOSS: "Verlust [kWh/a]",
     HEAT_LOSS_EXTRA_INSULATION: "Verlust bei extra Daemmung [kWh/a]",
     GLF: "GLF",
+    CAPACITY_MODEL: "Kapazitaet_Modell [kW]",
+    GLF_MODEL: "GLF_Modell",
+    INVEST_COST_MODEL: "Investition_Modell [EUR]",
+    INVEST_COST: "Investition [EUR]",
+    ANNUAL_COST: "Annuitaet [EUR/a]",
     # Load profile
     BUILDING_DEMAND_SUM: "Summe aller Gebäudetypen",
     LOSS: "Verlust",

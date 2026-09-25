@@ -41,7 +41,7 @@ import networkx as nx
 from shapely.geometry import LineString
 
 from fheat_core import columns as cols
-from fheat_core.optimization import HOUSE_CONNECTION, SOURCE_CONNECTION, STREET_PIPE
+from fheat_core.optimization import HOUSE_CONNECTION, ON_UNREACHABLE, SOURCE_CONNECTION, STREET_PIPE
 
 logger = logging.getLogger(__name__)
 
@@ -62,8 +62,6 @@ FLOW_FROM = "flow_from"         # fixed flow direction of a bridge (None if not 
 FLOW_TO = "flow_to"
 N_BEHIND = "n_behind"           # buildings behind a bridge in flow direction
 POWER_BEHIND = "power_behind"   # summed connection power behind a bridge [kW]
-
-_ON_UNREACHABLE = frozenset({"warn", "error"})
 
 
 @dataclass
@@ -150,10 +148,10 @@ def simplify_network(
     ``on_unreachable="warn"`` a warning names their IDs, with ``"error"`` a
     ``ValueError`` is raised instead.
     """
-    if on_unreachable not in _ON_UNREACHABLE:
+    if on_unreachable not in ON_UNREACHABLE:
         raise ValueError(
             f"on_unreachable '{on_unreachable}' is not allowed. "
-            f"Allowed values: {sorted(_ON_UNREACHABLE)}"
+            f"Allowed values: {sorted(ON_UNREACHABLE)}"
         )
     report = SimplificationReport(
         nodes_before=G.number_of_nodes(),
@@ -270,7 +268,7 @@ def _drop_removed_buildings(H, building_nodes) -> list:
 def _report_unreachable(buildings_gdf, unreachable, n_reachable, on_unreachable):
     """Step 6: warn about or refuse unreachable buildings; refuse an empty network."""
     if unreachable:
-        ids = _building_ids(buildings_gdf, unreachable)
+        ids = building_ids(buildings_gdf, unreachable)
         msg = f"{len(unreachable)} building(s) cannot be reached from a heat source: {ids}"
         if on_unreachable == "error":
             raise ValueError(msg)
@@ -279,7 +277,7 @@ def _report_unreachable(buildings_gdf, unreachable, n_reachable, on_unreachable)
         raise ValueError("No building can be reached from a heat source: there is no network to optimise.")
 
 
-def _building_ids(buildings_gdf, keys) -> list:
+def building_ids(buildings_gdf, keys) -> list:
     """``building_id`` of the given rows if the column exists, else their index."""
     if cols.BUILDING_ID in buildings_gdf.columns:
         return buildings_gdf.loc[keys, cols.BUILDING_ID].tolist()

@@ -84,6 +84,7 @@ BuildingsSchema = FrameSchema(
         cols.FLOOR_AREA: "float",
         cols.AGE: "str",
         cols.CONSTRUCTION_CLASS: "str",
+        cols.CONNECTION_STATUS: "str",   # written by network_method = "milp"
     },
     geometry_type="Polygon",
 )
@@ -164,6 +165,14 @@ NetSchema = FrameSchema(
         cols.VELOCITY: "float",
         cols.HEAT_LOSS: "float",
         cols.HEAT_LOSS_EXTRA_INSULATION: "float",
+    },
+    optional_columns={              # network_method = "milp"
+        cols.GLF: "float",
+        cols.CAPACITY_MODEL: "float",
+        cols.GLF_MODEL: "float",
+        cols.INVEST_COST_MODEL: "float",
+        cols.INVEST_COST: "float",
+        cols.ANNUAL_COST: "float",
     },
     geometry_type="LineString",
     allow_empty=True,

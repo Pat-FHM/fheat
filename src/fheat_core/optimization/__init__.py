@@ -10,9 +10,18 @@ MISSING_OPT_EXTRA = (
     '(oemof.solph, HiGHS): pip install "fheat[opt]"'
 )
 
+HOURS_PER_YEAR = 8760   # one time step of the energy system; loss kW ↔ kWh/a
+
 # Simultaneity in the design capacity, see ``glf_terms``.
 GLF_REFERENCE = "referenz"   # exact GLF on bridges, reference-tree GLF elsewhere
-GLF_OFF = "aus"              # no simultaneity (C ≥ S), for comparison
+GLF_OFF = "aus"              # no simultaneity (C = S), for comparison
+
+# Buildings without a route to the source (preprocess): warn or stop.
+ON_UNREACHABLE = frozenset({"warn", "error"})
+
+# Values of cols.CONNECTION_STATUS
+STATUS_CONNECTED = "angeschlossen"
+STATUS_UNREACHABLE = "nicht erreichbar"
 
 # Edge types (``cols.TYPE``) as set by ``fheat_core.algorithms.network``.
 HOUSE_CONNECTION = "Hausanschluss"

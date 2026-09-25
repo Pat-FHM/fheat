@@ -1,6 +1,6 @@
 from dataclasses import dataclass
 from enum import Enum
-from typing import Optional
+from typing import Any, Optional
 
 import geopandas as gpd
 import pandas as pd
@@ -33,3 +33,6 @@ class PipelineState:
     # Results
     load_profile_df: Optional[pd.DataFrame] = None
     result_summary: Optional[dict] = None
+
+    # network_method = "milp": fheat_core.optimization.network.OptimizationReport
+    optimization_report: Optional[Any] = None

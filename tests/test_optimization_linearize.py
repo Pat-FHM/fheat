@@ -85,7 +85,6 @@ class TestFitLinear:
         assert f.intercept == pytest.approx(10.0)
         assert f.r_squared == pytest.approx(1.0)
         assert f.max_abs_deviation == pytest.approx(0.0, abs=1e-12)
-        assert f(4.0) == pytest.approx(18.0)
 
     def test_deviation_relative_to_actual(self):
         f = fit_linear(["a", "b", "c"], [0.0, 1.0, 2.0], [10.0, 13.0, 10.0])

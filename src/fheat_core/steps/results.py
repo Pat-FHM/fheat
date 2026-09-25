@@ -58,6 +58,9 @@ def run(state: PipelineState, config, adapter) -> PipelineState:
         "return_temperature_c": config.return_temperature,
     }
 
+    if state.optimization_report is not None:   # network_method = "milp"
+        summary.update(state.optimization_report.summary())
+
     RESULT_SUMMARY_SCHEMA.validate(summary)
 
     state.load_profile_df = load_profile_df

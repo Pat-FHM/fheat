@@ -32,9 +32,8 @@ from fheat_core.algorithms.network import (  # noqa: E402
 )
 from fheat_core.config import OptimizationConfig  # noqa: E402
 from fheat_core.algorithms.network import calculate_glf  # noqa: E402
-from fheat_core.optimization import GLF_OFF, GLF_REFERENCE, HOUSE_CONNECTION  # noqa: E402
+from fheat_core.optimization import GLF_OFF, GLF_REFERENCE, HOURS_PER_YEAR, HOUSE_CONNECTION  # noqa: E402
 from fheat_core.optimization.energysystem import (  # noqa: E402
-    HOURS_PER_YEAR,
     MIP_ABS_GAP_AUTO_SHARE,
     solve_network,
 )
@@ -124,19 +123,19 @@ class TestMeshOptimum:
     def test_capacity_equals_power_without_glf(self, mesh_without_glf):
         _, _, res = mesh_without_glf
         built = res.edges[res.edges["built"]]
-        assert (built["glf_model"] == 1.0).all()
-        assert built["capacity"].to_numpy() == pytest.approx(built[cols.THERMAL_POWER].to_numpy())
+        assert (built[cols.GLF_MODEL] == 1.0).all()
+        assert built[cols.CAPACITY_MODEL].to_numpy() == pytest.approx(built[cols.THERMAL_POWER].to_numpy())
         src = res.edges[res.edges[cols.TYPE] == "Quellenanschluss"].iloc[0]
-        assert (src["capacity"], src[cols.N_BUILDINGS]) == (pytest.approx(50.0), pytest.approx(2))
+        assert (src[cols.CAPACITY_MODEL], src[cols.N_BUILDINGS]) == (pytest.approx(50.0), pytest.approx(2))
 
     def test_capacity_with_glf(self, mesh):
         _, _, res = mesh
         built = res.edges[res.edges["built"]]
-        assert built["capacity"].to_numpy() == pytest.approx(
-            (built["glf_model"] * built[cols.THERMAL_POWER]).to_numpy()
+        assert built[cols.CAPACITY_MODEL].to_numpy() == pytest.approx(
+            (built[cols.GLF_MODEL] * built[cols.THERMAL_POWER]).to_numpy()
         )
         src = res.edges[res.edges[cols.TYPE] == "Quellenanschluss"].iloc[0]
-        assert src["glf_model"] == pytest.approx(calculate_glf(2))
+        assert src[cols.GLF_MODEL] == pytest.approx(calculate_glf(2))
         assert res.source_capacity == pytest.approx(calculate_glf(2) * 50.0 + res.loss_flow)
 
     def test_glf_lowers_producer_capacity(self, mesh, mesh_without_glf):
@@ -148,7 +147,7 @@ class TestMeshOptimum:
         parts = res.objective_parts
         assert parts.total == pytest.approx(res.objective)
         pipe_annuity = economics.annuity(1.0, cfg.lifetime_pipes, cfg.interest_rate)
-        assert parts.pipes == pytest.approx(pipe_annuity * res.edges["invest_cost"].sum())
+        assert parts.pipes == pytest.approx(pipe_annuity * res.edges[cols.INVEST_COST_MODEL].sum())
         ep_costs = economics.annuity(cfg.source_capex_eur_per_kw, cfg.lifetime_source, cfg.interest_rate)
         assert parts.source_invest == pytest.approx(ep_costs * res.source_capacity)
         heat_cost = cfg.heat_cost_eur_per_kwh * HOURS_PER_YEAR
@@ -158,8 +157,8 @@ class TestMeshOptimum:
     def test_invest_cost_of_built_sections(self, mesh):
         _, lin, res = mesh
         for _, row in res.edges.iterrows():
-            expected = lin.invest_cost(row[cols.TYPE], row[cols.LENGTH], row["capacity"], int(row["built"]))
-            assert row["invest_cost"] == pytest.approx(expected, abs=1e-6)
+            expected = lin.invest_cost(row[cols.TYPE], row[cols.LENGTH], row[cols.CAPACITY_MODEL], int(row["built"]))
+            assert row[cols.INVEST_COST_MODEL] == pytest.approx(expected, abs=1e-6)
 
     def test_mip_abs_gap_auto(self, mesh):
         net, lin, res = mesh
@@ -220,11 +219,11 @@ class TestRandomNetworks:
         assert not e.duplicated(["u", "v"]).any()
         assert not net.graph.is_multigraph()
         assert (e["built"] == e["flow_from"].notna()).all()
-        assert (e.loc[~e["built"], "capacity"].abs() < 1e-6).all()
+        assert (e.loc[~e["built"], cols.CAPACITY_MODEL].abs() < 1e-6).all()
         pipe_info = load_pipe_info()
         for _, row in e[e["built"]].iterrows():
             assert {row["flow_from"], row["flow_to"]} == {row["u"], row["v"]}
-            vf = calculate_volumeflow(row["capacity"], HTEMP, LTEMP)
+            vf = calculate_volumeflow(row[cols.CAPACITY_MODEL], HTEMP, LTEMP)
             dn, *_ = calculate_diameter_velocity_loss(vf, HTEMP, LTEMP, row[cols.LENGTH], pipe_info, row[cols.TYPE])
             assert dn in set(pipe_info["DN"])
 
@@ -249,9 +248,9 @@ class TestRandomNetworks:
         assert res.demand_flow == pytest.approx(powers * FULL_LOAD_HOURS / HOURS_PER_YEAR)
         assert res.loss_flow == pytest.approx(res.edges["heat_loss"].sum())
         src = res.edges[res.edges[cols.TYPE] == "Quellenanschluss"].iloc[0]
-        assert res.source_capacity == pytest.approx(src["capacity"] + res.loss_flow)
+        assert res.source_capacity == pytest.approx(src[cols.CAPACITY_MODEL] + res.loss_flow)
         n = len(net.building_nodes)
-        assert src["capacity"] == pytest.approx(calculate_glf(n) * powers)
+        assert src[cols.CAPACITY_MODEL] == pytest.approx(calculate_glf(n) * powers)
 
     def test_fixed_bridges(self, seed):
         net, _, res = _random_solved(seed)

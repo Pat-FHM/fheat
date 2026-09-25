@@ -32,7 +32,7 @@ DataAdapter ──fetch──▶ PipelineState ──▶ FHeatOrchestrator ─�
   | `INITIAL` | download | input frames from the adapter |
   | `DOWNLOADED` | adjust | cleaned geometry, schema-validated frames |
   | `ADJUSTED` | status | heat-line density + suitability polygons |
-  | `STATUS` | network | shortest-path pipe network with sizing & losses |
+  | `STATUS` | network | pipe network with sizing & losses (shortest path, or [MILP](#milp-network-optimisation-optional)) |
   | `NETWORK` | results | hourly load profile + result summary |
 
 Adapters must produce data conforming to the contracts in [`schemas.py`](src/fheat_core/schemas.py); the core validates against the same schemas as it goes.
@@ -48,6 +48,7 @@ pip install -e .              # core pipeline + flexible adapter (your own data)
 pip install -e ".[nrw]"       # + NRW auto-download adapter (owslib, lxml)
 pip install -e ".[full]"      # everything: NRW adapter + German holidays
 pip install -e ".[full,dev]"  # everything + pytest, for development
+pip install -e ".[opt]"       # + optional MILP network optimisation (oemof.solph, HiGHS)
 ```
 
 All three import packages — `fheat_core`, `fheat_nrw`, `fheat_flex` — ship from the single `fheat` distribution. The extras only add the optional third-party dependencies a given adapter needs: the NRW adapter pulls in `owslib`/`lxml`, and holiday-aware load profiles pull in `workalendar`. All bundled reference data ships as plain text — CSV for tabular tables (pipe catalogue, example temperature year, NRW city index) and JSON for the keyed building-typology lookups (`fheat_nrw/data/*.json`) — so no package reads Excel. The separate `[excel]` extra adds `openpyxl` only for the optional `.xlsx` *export* in the examples.
@@ -111,6 +112,86 @@ German display labels by default (`output_language="de"`); set
 `output_language="raw"` to keep the canonical identifiers.
 
 Worked examples are in [`examples/`](examples/): [`burgsteinfurt.py`](examples/burgsteinfurt.py) (NRW adapter, runnable with the bundled planning area `planungsgebiet.gpkg`) and an introductory notebook [`fheat_einfuehrung.ipynb`](examples/fheat_einfuehrung.ipynb). If you want to add an own area of interest for the analysis you can import it by exporting a polygon with using QGIS.
+
+## MILP network optimisation (optional)
+
+By default the network step connects every building along its shortest path
+(Dijkstra). With `network_method="milp"` it designs a cost-optimal radial
+network instead: a mixed-integer linear program on an
+[oemof.solph](https://github.com/oemof/oemof-solph) energy system (producer →
+network → consumers and losses), solved once with HiGHS. It needs the `[opt]`
+extra; without it the default step is unchanged.
+
+```python
+from fheat_core.config import FHeatConfig, OptimizationConfig
+
+config = FHeatConfig(
+    network_method="milp",
+    optimization=OptimizationConfig(time_limit_s=300),   # None → defaults
+)
+```
+
+What the step does:
+
+1. builds the street graph as the shortest-path step does, then simplifies it
+   (integer node IDs, dead ends removed, street chains merged, parallel
+   sections reduced, bridges fixed) without changing the optimum;
+2. linearises pipe cost [€/m] and heat loss [W/m] over the design capacity;
+3. takes the simultaneity factor (GLF) into the route choice:
+   `glf_mode="referenz"` uses the exact GLF behind every bridge and the GLF of
+   the shortest-path tree elsewhere; `"aus"` sizes without GLF, for comparison;
+4. solves the MILP once; HiGHS stops at the absolute gap `mip_abs_gap` [€/a]
+   or at `time_limit_s`;
+5. re-calculates the chosen network with the exact GLF, the real DN
+   (`calculate_diameter_velocity_loss`) and the real pipe costs.
+
+Every reachable building with `connect == 1` is connected (forced mode).
+Buildings without a route to the source get `connect = 0` and
+`connection_status = "nicht erreichbar"` (`on_unreachable="error"` stops
+instead). The formulation (sets, variables, numbered constraints, objective) is
+documented in [`optimization/block.py`](src/fheat_core/optimization/block.py).
+
+**Outputs.** `net_gdf` satisfies `NetSchema` and has additional columns that
+put model and post-calculated values side by side:
+
+| Column | German label | Meaning |
+|---|---|---|
+| `glf` | `GLF` | exact GLF of the section |
+| `glf_model` | `GLF_Modell` | GLF used in the MILP |
+| `capacity_model` | `Kapazitaet_Modell [kW]` | design capacity in the MILP (compare with `thermal_power_glf`) |
+| `invest_cost_model` | `Investition_Modell [EUR]` | linearised pipe investment |
+| `invest_cost` | `Investition [EUR]` | pipe investment of the chosen DN |
+| `annual_cost` | `Annuitaet [EUR/a]` | annuity of `invest_cost` |
+
+The buildings get `connection_status` (`Anschlussstatus`). The result summary
+adds `milp_*` key figures (objective, gap, solve time, producer capacity
+GLF(N) · ΣQ + losses, real and linearised pipe investment and their deviation,
+unreachable buildings). `state.optimization_report` holds the full report,
+including the quality of every cost and loss line per DN.
+
+**Parameters** (`OptimizationConfig`):
+
+| Field | Default | Note |
+|---|---|---|
+| `glf_mode` | `"referenz"` | `"aus"`: no simultaneity, for comparison |
+| `interest_rate`, `lifetime_pipes` | 0.08, 20 a | placeholder, Lambert et al. 2025 |
+| `source_capex_eur_per_kw`, `lifetime_source` | 598 €/kW, 20 a | placeholder, Lambert et al. 2025, Tab. 7 (central air-water heat pump) |
+| `heat_cost_eur_per_kwh` | 0.08 | placeholder, Lambert et al. 2024, Tab. 1 |
+| `soil_temperature` | 10 °C | heat loss 2 · U · (T_mean − T_soil), as the shortest-path step |
+| `regression_max_deviation` | 0.15 | warning if a cost or loss line deviates more at one DN |
+| `on_unreachable` | `"warn"` | `"error"`: stop if a building cannot be reached |
+| `mip_abs_gap` | `"auto"` | [€/a]; `"auto"` = 0.5 % of the pipe annuity of the shortest-path tree |
+| `time_limit_s` | 300 | solver time limit |
+
+The pipe costs in `fheat_core/data/pipe_costs.csv` (Lambert et al. 2025,
+Tab. 8) and the economic defaults are **placeholders** (`PLATZHALTER`) and must
+be replaced by project-specific values; an adapter can supply its own costs
+via `provide_pipe_costs()`.
+
+**Limits.** One heat source, which must lie beside the street network (not
+exactly on a street vertex). One time step (annual energy, design case). The
+GLF of sections that are not bridges is estimated from the shortest-path tree;
+the post-calculation reports the exact value.
 
 ## Tests
 

@@ -22,14 +22,41 @@ from fheat_core.state import Phase, PipelineState
 
 
 def run(state: PipelineState, config, adapter) -> PipelineState:
+    if config.network_method == "milp":
+        return _run_milp(state, config, adapter)
+
     pipe_info = adapter.provide_pipe_info()
     if pipe_info is None:
         pipe_info = load_pipe_info()
 
-    buildings = state.buildings_gdf.copy()
-    streets = state.streets_gdf.copy()
-    source = state.source_gdf.copy()
+    G, buildings, source = prepare_graph(
+        state.buildings_gdf.copy(), state.streets_gdf.copy(), state.source_gdf.copy()
+    )
 
+    net_gdf = compute_network(
+        G,
+        buildings,
+        source,
+        pipe_info,
+        power_att=cols.THERMAL_POWER,
+        htemp=config.supply_temperature,
+        ltemp=config.return_temperature,
+        crs=buildings.crs,
+    )
+
+    NetSchema.validate(net_gdf)
+
+    state.net_gdf = net_gdf
+    state.phase = Phase.NETWORK
+    return state
+
+
+def prepare_graph(buildings: gpd.GeoDataFrame, streets: gpd.GeoDataFrame, source: gpd.GeoDataFrame):
+    """Street graph with house and source connections for every network method.
+
+    Returns ``(G, buildings, source)``: the graph and the buildings with
+    ``connect == 1`` and the source, both with centroid and connection point.
+    """
     # restrict to connectable routes and buildings with heat connection
     if cols.ROUTABLE in streets.columns:
         streets = streets[streets[cols.ROUTABLE] == 1]
@@ -55,20 +82,25 @@ def run(state: PipelineState, config, adapter) -> PipelineState:
     G = connect_buildings_to_graph(G, buildings)
     G = connect_source_to_graph(G, source)
     G = add_edge_lengths(G)
+    return G, buildings, source
 
-    net_gdf = compute_network(
-        G,
-        buildings,
-        source,
-        pipe_info,
-        power_att=cols.THERMAL_POWER,
-        htemp=config.supply_temperature,
-        ltemp=config.return_temperature,
-        crs=buildings.crs,
+
+def _run_milp(state: PipelineState, config, adapter) -> PipelineState:
+    """network_method = "milp": optimised network, ``connect`` written back."""
+    from fheat_core.optimization.network import REPORT_KEY, build_network
+
+    net_gdf, candidates = build_network(
+        state.buildings_gdf.copy(), state.streets_gdf.copy(), state.source_gdf.copy(), config, adapter
     )
-
     NetSchema.validate(net_gdf)
 
+    buildings = state.buildings_gdf.copy()
+    buildings[cols.CONNECTION_STATUS] = None
+    buildings.loc[candidates.index, cols.CONNECT] = candidates[cols.CONNECT]
+    buildings.loc[candidates.index, cols.CONNECTION_STATUS] = candidates[cols.CONNECTION_STATUS]
+
+    state.optimization_report = net_gdf.attrs.pop(REPORT_KEY)
+    state.buildings_gdf = buildings
     state.net_gdf = net_gdf
     state.phase = Phase.NETWORK
     return state

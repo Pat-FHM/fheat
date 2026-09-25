@@ -61,9 +61,6 @@ class LinearFit:
     r_squared: float
     table: pd.DataFrame
 
-    def __call__(self, capacity):
-        return self.slope * np.asarray(capacity, dtype=float) + self.intercept
-
     @property
     def max_abs_deviation(self) -> float:
         return float(self.table["deviation"].abs().max())
@@ -134,6 +131,15 @@ class PipeLinearization:
                 t["r_squared"] = f.r_squared
                 frames.append(t)
         return pd.concat(frames, ignore_index=True)
+
+
+def trench_loss(u_value, htemp: float, ltemp: float, soil_temperature: float):
+    """Heat loss [W/m] of supply and return pipe: 2 · U · (T_mean − T_soil).
+
+    ``u_value`` [W/(m·K)] per pipe (number or Series). With T_soil = 10 °C this
+    is the loss of ``calculate_diameter_velocity_loss`` per hour and metre.
+    """
+    return 2 * u_value * ((htemp + ltemp) / 2 - soil_temperature)
 
 
 def pipe_capacities(pipe_info: pd.DataFrame, htemp: float, ltemp: float) -> pd.Series:
@@ -266,8 +272,7 @@ def _catalogue(pipe_info, pipe_costs, htemp, ltemp, soil_temperature) -> pd.Data
     """Catalogue with cost [€/m], capacity Q_max [kW] and loss [W/m] per DN."""
     catalogue = merge_pipe_costs(pipe_info, pipe_costs).reset_index(drop=True)
     catalogue["capacity"] = pipe_capacities(catalogue, htemp, ltemp)
-    t_mean = (htemp + ltemp) / 2
-    catalogue["loss_w_per_m"] = 2 * catalogue["U-Value"] * (t_mean - soil_temperature)
+    catalogue["loss_w_per_m"] = trench_loss(catalogue["U-Value"], htemp, ltemp, soil_temperature)
     return catalogue
 
 

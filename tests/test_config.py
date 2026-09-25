@@ -85,6 +85,7 @@ class TestOptimizationConfig:
         assert cfg.heat_cost_eur_per_kwh == 0.08
         assert (cfg.mip_abs_gap, cfg.time_limit_s) == ("auto", 300.0)
         assert cfg.glf_mode == "referenz"
+        assert (cfg.soil_temperature, cfg.regression_max_deviation, cfg.on_unreachable) == (10.0, 0.15, "warn")
 
     @pytest.mark.parametrize("kwargs, match", [
         ({"interest_rate": 0.0}, "interest_rate"),
@@ -94,6 +95,8 @@ class TestOptimizationConfig:
         ({"source_capex_eur_per_kw": -1.0}, "source_capex_eur_per_kw"),
         ({"heat_cost_eur_per_kwh": -0.1}, "heat_cost_eur_per_kwh"),
         ({"glf_mode": "tangente"}, "glf_mode"),
+        ({"on_unreachable": "ignore"}, "on_unreachable"),
+        ({"regression_max_deviation": 0.0}, "regression_max_deviation"),
         ({"mip_abs_gap": "fast"}, "mip_abs_gap"),
         ({"mip_abs_gap": -5.0}, "mip_abs_gap"),
     ])
@@ -107,3 +110,26 @@ class TestOptimizationConfig:
         from fheat_core.config import OptimizationConfig
 
         assert OptimizationConfig(mip_abs_gap=250.0).mip_abs_gap == 250.0
+
+
+class TestNetworkMethod:
+    def test_default_is_shortest_path(self):
+        cfg = FHeatConfig()
+        assert cfg.network_method == "shortest_path"
+        assert cfg.optimization is None
+
+    def test_milp_gets_default_optimization_config(self):
+        from fheat_core.config import OptimizationConfig
+
+        cfg = FHeatConfig(network_method="milp")
+        assert cfg.optimization == OptimizationConfig()
+
+    def test_milp_keeps_given_optimization_config(self):
+        from fheat_core.config import OptimizationConfig
+
+        opt = OptimizationConfig(glf_mode="aus", time_limit_s=60.0)
+        assert FHeatConfig(network_method="milp", optimization=opt).optimization is opt
+
+    def test_unknown_method_raises(self):
+        with pytest.raises(ValueError, match="network_method"):
+            FHeatConfig(network_method="steiner")

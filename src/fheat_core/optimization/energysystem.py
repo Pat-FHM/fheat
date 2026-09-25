@@ -25,7 +25,7 @@ import pandas as pd
 
 from fheat_core import columns as cols
 from fheat_core.config import OptimizationConfig
-from fheat_core.optimization import MISSING_OPT_EXTRA
+from fheat_core.optimization import HOURS_PER_YEAR, MISSING_OPT_EXTRA
 from fheat_core.optimization.block import build_network_block
 from fheat_core.optimization.glf_terms import ReferenceTree, glf_factors, reference_tree
 from fheat_core.optimization.linearize import PipeLinearization
@@ -42,7 +42,6 @@ except ImportError as err:
 
 logger = logging.getLogger(__name__)
 
-HOURS_PER_YEAR = 8760
 MIP_ABS_GAP_AUTO_SHARE = 0.005   # "auto": 0.5 % of the pipe annuity of the reference tree
 
 
@@ -66,10 +65,10 @@ class MilpResult:
 
     ``edges`` has one row per section of the simplified graph: ``u``, ``v``,
     ``cols.TYPE``, ``cols.LENGTH`` [m], ``fixed`` (bridge built without a
-    binary), ``built``, ``flow_from``, ``flow_to``, ``capacity`` [kW],
-    ``cols.THERMAL_POWER`` (S [kW]), ``cols.N_BUILDINGS`` (n), ``glf_model``
-    (g_e used in block.py, (7)), ``heat_loss`` [kW] and ``invest_cost`` [€]
-    of the linearised model.
+    binary), ``built``, ``flow_from``, ``flow_to``, ``cols.CAPACITY_MODEL``
+    (C [kW]), ``cols.THERMAL_POWER`` (S [kW]), ``cols.N_BUILDINGS`` (n),
+    ``cols.GLF_MODEL`` (g_e of block.py, (7)), ``heat_loss`` [kW] and
+    ``cols.INVEST_COST_MODEL`` [€] of the linearised model.
     """
 
     termination: str
@@ -125,7 +124,7 @@ def solve_network(
     model = solph.Model(es)
     model.netz = build_network_block(network, linearization, glf)
     _couple(model, comp, demand_flow)
-    _add_pipe_annuity(model, _pipe_annuity(config))
+    _add_pipe_annuity(model, pipe_annuity(config))
     abs_gap = _mip_abs_gap(network, linearization, tree, glf, config)
     build_time = time.perf_counter() - t0
 
@@ -135,7 +134,7 @@ def solve_network(
     return _result(model, comp, network, glf, results, config, abs_gap, (build_time, solve_time))
 
 
-def _pipe_annuity(config) -> float:
+def pipe_annuity(config) -> float:
     """Annuity factor of the pipes [1/a]."""
     return economics.annuity(1.0, config.lifetime_pipes, config.interest_rate)
 
@@ -191,7 +190,7 @@ def _mip_abs_gap(network, linearization, tree: ReferenceTree, glf, config) -> fl
         linearization.invest_cost(H.edges[e][cols.TYPE], H.edges[e][cols.LENGTH], glf[e] * s0, 1)
         for e, s0 in tree.s0.items()
     )
-    return MIP_ABS_GAP_AUTO_SHARE * _pipe_annuity(config) * invest
+    return MIP_ABS_GAP_AUTO_SHARE * pipe_annuity(config) * invest
 
 
 def _run_highs(model, abs_gap, time_limit_s):
@@ -223,7 +222,7 @@ def _result(model, comp, network, glf, results, config, abs_gap, run_times) -> M
         source_invest=ep_costs * po.value(invest),
         heat_demand=heat_cost * demand_flow,
         heat_losses=heat_cost * loss_flow,
-        pipes=_pipe_annuity(config) * po.value(netz.invest_cost),
+        pipes=pipe_annuity(config) * po.value(netz.invest_cost),
     )
     return MilpResult(
         termination=str(results.termination_condition.name),
@@ -255,11 +254,11 @@ def _edge_table(netz, network, glf) -> pd.DataFrame:
             "built": po.value(netz.built[e]) > 0.5,
             "flow_from": arc[0] if arc else None,
             "flow_to": arc[1] if arc else None,
-            "capacity": po.value(netz.capacity[e]),
+            cols.CAPACITY_MODEL: po.value(netz.capacity[e]),
             cols.THERMAL_POWER: po.value(netz.power_flow[arc]) if arc else 0.0,
             cols.N_BUILDINGS: po.value(netz.count_flow[arc]) if arc else 0.0,
-            "glf_model": glf[e],
+            cols.GLF_MODEL: glf[e],
             "heat_loss": po.value(netz.section_loss[e]),
-            "invest_cost": po.value(netz.section_invest[e]),
+            cols.INVEST_COST_MODEL: po.value(netz.section_invest[e]),
         })
     return pd.DataFrame(rows)

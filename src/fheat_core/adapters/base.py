@@ -48,6 +48,11 @@ class DataAdapter(ABC):
         """Optional: pipe catalogue (DN, di, U-Value, max_volumeFlow). None → core default."""
         return None
 
+    def provide_pipe_costs(self) -> Optional[pd.DataFrame]:
+        """Optional: pipe costs (DN, cost_eur_per_m [€ per trench metre]) for
+        network_method = "milp". None → core default (PLATZHALTER values)."""
+        return None
+
     def provide_temperature(self) -> Optional[pd.Series]:
         """Optional: 8760 hourly temperatures [°C]. None → core default."""
         return None
