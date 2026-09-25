@@ -1,20 +1,19 @@
 """Entry point of the MILP network optimisation: :func:`build_network`.
 
-Same shape as a network backend: ``(buildings, streets, source, config,
-adapter) -> (net_gdf, buildings)``. Steps:
+``(buildings, streets, source, config, adapter) -> NetworkResult(net_gdf,
+buildings, report)``; unpacking the first two gives the shape of a network
+backend. Steps:
 
 1. street graph as for the shortest-path network (``steps.network.prepare_graph``),
 2. graph simplification (``preprocess``),
 3. linearised pipe costs and losses (``linearize``, ``glf_terms.design_loads``),
 4. oemof.solph system with the network block, solved once (``energysystem``),
 5. post-calculation with exact GLF and real DN (``postprocess``).
-
-The returned ``net_gdf`` carries an :class:`OptimizationReport` in
-``net_gdf.attrs[REPORT_KEY]``; the network step moves it to the pipeline state.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import NamedTuple
 
 import geopandas as gpd
 import pandas as pd
@@ -27,9 +26,6 @@ from fheat_core.optimization.linearize import linearize_pipes
 from fheat_core.optimization.postprocess import PostCalculation, postprocess
 from fheat_core.optimization.preprocess import SimplificationReport, building_ids, simplify_network
 from fheat_core.resources import load_pipe_costs, load_pipe_info
-
-REPORT_KEY = "optimization_report"
-
 
 @dataclass(frozen=True)
 class OptimizationReport:
@@ -76,19 +72,27 @@ class OptimizationReport:
         }
 
 
+class NetworkResult(NamedTuple):
+    """Result of :func:`build_network`.
+
+    ``net_gdf``: ``NetSchema`` plus the optional model columns. ``buildings``:
+    the buildings with ``connect == 1`` on input, with ``cols.CONNECT`` and
+    ``cols.CONNECTION_STATUS`` updated.
+    """
+
+    net_gdf: gpd.GeoDataFrame
+    buildings: gpd.GeoDataFrame
+    report: OptimizationReport
+
+
 def build_network(
     buildings: gpd.GeoDataFrame,
     streets: gpd.GeoDataFrame,
     source: gpd.GeoDataFrame,
     config,
     adapter,
-) -> tuple[gpd.GeoDataFrame, gpd.GeoDataFrame]:
-    """MILP network for ``config.network_method = "milp"`` (forced mode).
-
-    Returns ``net_gdf`` (``NetSchema`` plus the optional model columns) and the
-    buildings with ``connect == 1`` on input, with ``cols.CONNECT`` (0 if
-    unreachable) and ``cols.CONNECTION_STATUS`` updated.
-    """
+) -> NetworkResult:
+    """MILP network for ``config.network_method = "milp"``."""
     from fheat_core.steps.network import prepare_graph
 
     opt = config.optimization
@@ -100,11 +104,11 @@ def build_network(
     lin = linearize_pipes(
         pipe_info, pipe_costs, design_loads(network),
         config.supply_temperature, config.return_temperature,
-        soil_temperature=opt.soil_temperature, max_deviation=opt.regression_max_deviation,
+        max_deviation=opt.regression_max_deviation,
     )
     milp = solve_network(network, lin, candidates[cols.HEAT_DEMAND].to_dict(), opt)
     net_gdf, post = postprocess(network, milp.edges, lin, pipe_info, pipe_costs, pipe_annuity(opt), candidates.crs)
-    net_gdf.attrs[REPORT_KEY] = OptimizationReport(
+    report = OptimizationReport(
         milp=milp,
         post=post,
         simplification=network.report,
@@ -112,7 +116,9 @@ def build_network(
         fit_warnings=lin.warnings,
         unreachable=building_ids(candidates, network.unreachable_buildings),
     )
-    return net_gdf, _connection_status(buildings.loc[candidates.index], network.unreachable_buildings)
+    return NetworkResult(
+        net_gdf, _connection_status(buildings.loc[candidates.index], network.unreachable_buildings), report
+    )
 
 
 def _or_default(provided, load):

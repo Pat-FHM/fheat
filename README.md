@@ -177,7 +177,6 @@ including the quality of every cost and loss line per DN.
 | `interest_rate`, `lifetime_pipes` | 0.08, 20 a | placeholder, Lambert et al. 2025 |
 | `source_capex_eur_per_kw`, `lifetime_source` | 598 €/kW, 20 a | placeholder, Lambert et al. 2025, Tab. 7 (central air-water heat pump) |
 | `heat_cost_eur_per_kwh` | 0.08 | placeholder, Lambert et al. 2024, Tab. 1 |
-| `soil_temperature` | 10 °C | heat loss 2 · U · (T_mean − T_soil), as the shortest-path step |
 | `regression_max_deviation` | 0.15 | warning if a cost or loss line deviates more at one DN |
 | `on_unreachable` | `"warn"` | `"error"`: stop if a building cannot be reached |
 | `mip_abs_gap` | `"auto"` | [€/a]; `"auto"` = 0.5 % of the pipe annuity of the shortest-path tree |
@@ -188,8 +187,7 @@ Tab. 8) and the economic defaults are **placeholders** (`PLATZHALTER`) and must
 be replaced by project-specific values; an adapter can supply its own costs
 via `provide_pipe_costs()`.
 
-**Limits.** One heat source, which must lie beside the street network (not
-exactly on a street vertex). One time step (annual energy, design case). The
+**Limits.** One heat source. One time step (annual energy, design case). The
 GLF of sections that are not bridges is estimated from the shortest-path tree;
 the post-calculation reports the exact value.
 

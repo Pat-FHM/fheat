@@ -20,7 +20,7 @@ from fheat_core.algorithms.network import (  # noqa: E402
     calculate_volumeflow,
 )
 from fheat_core.config import OptimizationConfig  # noqa: E402
-from fheat_core.optimization import HOURS_PER_YEAR, SOURCE_CONNECTION  # noqa: E402
+from fheat_core.optimization import HOURS_PER_YEAR  # noqa: E402
 from fheat_core.optimization.energysystem import pipe_annuity, solve_network  # noqa: E402
 from fheat_core.optimization.glf_terms import design_loads  # noqa: E402
 from fheat_core.optimization.linearize import linearize_pipes, merge_pipe_costs  # noqa: E402
@@ -34,11 +34,11 @@ from tests.optimization_graphs import CRS, random_case  # noqa: E402
 HTEMP, LTEMP = 80.0, 50.0
 
 
-def _post(seed, soil_temperature=10.0):
+def _post(seed):
     net = simplify_network(*random_case(seed))
-    cfg = OptimizationConfig(soil_temperature=soil_temperature)
+    cfg = OptimizationConfig()
     pipe_info, pipe_costs = load_pipe_info(), load_pipe_costs()
-    lin = linearize_pipes(pipe_info, pipe_costs, design_loads(net), HTEMP, LTEMP, soil_temperature=soil_temperature)
+    lin = linearize_pipes(pipe_info, pipe_costs, design_loads(net), HTEMP, LTEMP)
     demand = {k: net.graph.nodes[n]["power"] * 2000 for k, n in net.building_nodes.items()}
     res = solve_network(net, lin, demand, cfg)
     net_gdf, post = postprocess(net, res.edges, lin, pipe_info, pipe_costs, pipe_annuity(cfg), CRS)
@@ -64,7 +64,7 @@ class TestPostCalculation:
             assert row[cols.VOLUME_FLOW] == pytest.approx(vf)
             assert vf <= pipe_info.loc[row[cols.NOMINAL_DIAMETER], "max_volumeFlow"]
 
-    def test_losses_equal_fheat_at_10_degrees(self, seed):
+    def test_dn_velocity_losses_from_fheat(self, seed):
         _, _, net_gdf, _ = _post(seed)
         pipe_info = load_pipe_info()
         for _, row in net_gdf.iterrows():
@@ -110,12 +110,3 @@ class TestPostCalculation:
         for geom, flow_from, flow_to in zip(net_gdf.geometry, built["flow_from"], built["flow_to"], strict=True):
             assert geom.coords[0] == net.node_coords[flow_from]
             assert geom.coords[-1] == net.node_coords[flow_to]
-
-
-class TestSoilTemperature:
-    def test_warmer_soil_lowers_losses(self):
-        _, _, cold, _ = _post(1, soil_temperature=10.0)
-        _, _, warm, _ = _post(1, soil_temperature=15.0)
-        assert warm[cols.HEAT_LOSS].sum() < cold[cols.HEAT_LOSS].sum()
-        src = warm[warm[cols.TYPE] == SOURCE_CONNECTION]
-        assert len(src) == 1

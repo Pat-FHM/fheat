@@ -1,8 +1,9 @@
 """Tests for build_network and network_method = "milp" in the pipeline.
 
 Covers:
-- build_network returns NetSchema-conformant net_gdf, the report and the
-  candidate buildings with connect / connection_status
+- build_network returns NetworkResult: NetSchema-conformant net_gdf, the
+  candidate buildings with connect / connection_status and the report; the
+  conftest source lies on a street vertex
 - network step: connect written back to the full building table, status
   "nicht erreichbar", on_unreachable = "error", one heat source only
 - orchestrator: all steps, result summary with milp_* key figures,
@@ -21,7 +22,7 @@ pytest.importorskip("oemof.solph")
 from fheat_core import columns as cols  # noqa: E402
 from fheat_core.config import FHeatConfig, OptimizationConfig  # noqa: E402
 from fheat_core.optimization import STATUS_CONNECTED, STATUS_UNREACHABLE  # noqa: E402
-from fheat_core.optimization.network import REPORT_KEY, OptimizationReport, build_network  # noqa: E402
+from fheat_core.optimization.network import NetworkResult, OptimizationReport, build_network  # noqa: E402
 from fheat_core.orchestrator import FHeatOrchestrator  # noqa: E402
 from fheat_core.resources import load_pipe_costs  # noqa: E402
 from fheat_core.schemas import NetSchema  # noqa: E402
@@ -37,11 +38,10 @@ def milp_cfg(tmp_path):
 
 
 @pytest.fixture
-def area(buildings_gdf, streets_gdf, parcels_gdf, temperature_series):
+def area(buildings_gdf, streets_gdf, parcels_gdf, source_gdf, temperature_series):
     """Conftest area plus building 3 (connect = 0) and building 4 next to a
-    street without a route to the source (unreachable). The source lies 10 m
-    beside the street: a source exactly on a street vertex is rejected by the
-    graph simplification (no single source connection edge)."""
+    street without a route to the source (unreachable). The conftest source
+    lies exactly on the first street vertex."""
     extra = gpd.GeoDataFrame(
         {
             cols.BUILDING_ID: [3, 4],
@@ -62,10 +62,9 @@ def area(buildings_gdf, streets_gdf, parcels_gdf, temperature_series):
         {cols.ROUTABLE: [1, 1], "geometry": [streets_gdf.geometry.iloc[0], LineString([(500, 500), (600, 500)])]},
         crs=CRS,
     )
-    source = gpd.GeoDataFrame({"geometry": [Point(-10, -15)]}, crs=CRS)
-    adapter = StubAdapter(buildings, streets, parcels_gdf, source,
+    adapter = StubAdapter(buildings, streets, parcels_gdf, source_gdf,
                           temperature=temperature_series, holidays={})
-    return buildings, streets, source, adapter
+    return buildings, streets, source_gdf, adapter
 
 
 def _state(buildings, streets, source):
@@ -73,19 +72,21 @@ def _state(buildings, streets, source):
 
 
 class TestBuildNetwork:
-    def test_returns_net_and_candidates(self, area, milp_cfg):
+    def test_returns_network_result(self, area, milp_cfg):
         buildings, streets, source, adapter = area
-        net_gdf, candidates = build_network(buildings, streets, source, milp_cfg, adapter)
+        result = build_network(buildings, streets, source, milp_cfg, adapter)
+        assert isinstance(result, NetworkResult)
+        net_gdf, candidates, report = result
         NetSchema.validate(net_gdf)
-        assert isinstance(net_gdf.attrs[REPORT_KEY], OptimizationReport)
+        assert isinstance(report, OptimizationReport)
+        assert not net_gdf.attrs
         assert isinstance(candidates, gpd.GeoDataFrame)
         assert sorted(candidates[cols.BUILDING_ID]) == [0, 1, 2, 4]
         assert set(candidates.columns) == set(buildings.columns) | {cols.CONNECTION_STATUS}
 
     def test_report(self, area, milp_cfg):
         buildings, streets, source, adapter = area
-        net_gdf, _ = build_network(buildings, streets, source, milp_cfg, adapter)
-        report = net_gdf.attrs[REPORT_KEY]
+        report = build_network(buildings, streets, source, milp_cfg, adapter).report
         assert report.unreachable == [4]
         assert report.milp.termination == "optimal"
         assert {"quantity", "edge_type", "DN", "deviation", "r_squared"} <= set(report.fit_quality.columns)
@@ -112,7 +113,6 @@ class TestNetworkStep:
         buildings, streets, source, adapter = area
         state = network.run(_state(buildings, streets, source), milp_cfg, adapter)
         assert isinstance(state.optimization_report, OptimizationReport)
-        assert REPORT_KEY not in state.net_gdf.attrs
         assert state.phase == Phase.NETWORK
 
     def test_on_unreachable_error(self, area, tmp_path):
@@ -124,7 +124,7 @@ class TestNetworkStep:
 
     def test_more_than_one_source_raises(self, area, milp_cfg):
         buildings, streets, _, adapter = area
-        sources = gpd.GeoDataFrame({"geometry": [Point(-10, -15), Point(200, -15)]}, crs=CRS)
+        sources = gpd.GeoDataFrame({"geometry": [Point(-10, -5), Point(200, -5)]}, crs=CRS)
         with pytest.raises(ValueError, match="exactly one heat source"):
             network.run(_state(buildings, streets, sources), milp_cfg, adapter)
 

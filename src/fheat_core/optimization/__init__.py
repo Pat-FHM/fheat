@@ -11,6 +11,7 @@ MISSING_OPT_EXTRA = (
 )
 
 HOURS_PER_YEAR = 8760   # one time step of the energy system; loss kW ↔ kWh/a
+SOIL_TEMPERATURE = 10.0  # [°C], fixed as in calculate_diameter_velocity_loss
 
 # Simultaneity in the design capacity, see ``glf_terms``.
 GLF_REFERENCE = "referenz"   # exact GLF on bridges, reference-tree GLF elsewhere

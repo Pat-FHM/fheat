@@ -87,9 +87,9 @@ def prepare_graph(buildings: gpd.GeoDataFrame, streets: gpd.GeoDataFrame, source
 
 def _run_milp(state: PipelineState, config, adapter) -> PipelineState:
     """network_method = "milp": optimised network, ``connect`` written back."""
-    from fheat_core.optimization.network import REPORT_KEY, build_network
+    from fheat_core.optimization.network import build_network
 
-    net_gdf, candidates = build_network(
+    net_gdf, candidates, report = build_network(
         state.buildings_gdf.copy(), state.streets_gdf.copy(), state.source_gdf.copy(), config, adapter
     )
     NetSchema.validate(net_gdf)
@@ -99,7 +99,7 @@ def _run_milp(state: PipelineState, config, adapter) -> PipelineState:
     buildings.loc[candidates.index, cols.CONNECT] = candidates[cols.CONNECT]
     buildings.loc[candidates.index, cols.CONNECTION_STATUS] = candidates[cols.CONNECTION_STATUS]
 
-    state.optimization_report = net_gdf.attrs.pop(REPORT_KEY)
+    state.optimization_report = report
     state.buildings_gdf = buildings
     state.net_gdf = net_gdf
     state.phase = Phase.NETWORK

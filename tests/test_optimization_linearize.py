@@ -28,6 +28,7 @@ from fheat_core.optimization.linearize import (
     merge_pipe_costs,
     pipe_capacities,
     regression_range,
+    trench_loss,
 )
 from fheat_core.resources import load_pipe_costs, load_pipe_info
 
@@ -207,11 +208,17 @@ class TestLinearizePipes:
         dn, _, loss_kwh, _ = calculate_diameter_velocity_loss(vf, 70, 50, 1.0, pipe_info, STREET_PIPE)
         assert t.loc[dn, "actual"] * 8760 / 1000 == pytest.approx(loss_kwh)
 
-    def test_soil_temperature_changes_losses(self, pipe_info, pipe_costs):
-        warm = linearize_pipes(pipe_info, pipe_costs, _loads([50.0] * 50), 70, 50, soil_temperature=15.0)
-        cold = linearize_pipes(pipe_info, pipe_costs, _loads([50.0] * 50), 70, 50, soil_temperature=5.0)
-        assert warm.street_loss.intercept < cold.street_loss.intercept
-        assert warm.soil_temperature == 15.0
+    def test_trench_loss_equals_fheat_for_every_dn(self, pipe_info):
+        """trench_loss · 8760 h / 1000 is the loss of calculate_diameter_velocity_loss."""
+        from fheat_core.algorithms.network import calculate_diameter_velocity_loss
+
+        for i in range(len(pipe_info)):
+            vf = pipe_info["max_volumeFlow"].iloc[i] * 0.999
+            edge_type = HOUSE_CONNECTION if i < 2 else STREET_PIPE
+            dn, _, loss, loss_extra = calculate_diameter_velocity_loss(vf, 80, 50, 7.0, pipe_info, edge_type)
+            row = pipe_info[pipe_info["DN"] == dn].iloc[0]
+            assert trench_loss(row["U-Value"], 80, 50) * 7.0 * 8760 / 1000 == pytest.approx(loss)
+            assert trench_loss(row["U-Value_extra_insulation"], 80, 50) * 7.0 * 8760 / 1000 == pytest.approx(loss_extra)
 
     def test_negative_design_load_raises(self, pipe_info, pipe_costs):
         with pytest.raises(ValueError, match="negative"):

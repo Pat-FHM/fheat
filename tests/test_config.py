@@ -85,7 +85,7 @@ class TestOptimizationConfig:
         assert cfg.heat_cost_eur_per_kwh == 0.08
         assert (cfg.mip_abs_gap, cfg.time_limit_s) == ("auto", 300.0)
         assert cfg.glf_mode == "referenz"
-        assert (cfg.soil_temperature, cfg.regression_max_deviation, cfg.on_unreachable) == (10.0, 0.15, "warn")
+        assert (cfg.regression_max_deviation, cfg.on_unreachable) == (0.15, "warn")
 
     @pytest.mark.parametrize("kwargs, match", [
         ({"interest_rate": 0.0}, "interest_rate"),

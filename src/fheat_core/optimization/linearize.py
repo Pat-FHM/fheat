@@ -8,7 +8,7 @@ lines over the capacity of the catalogue DNs (block.py, objective and (8)):
 
 with Q_max = V̇_max · ρ · c_p · (T_VL − T_RL) per DN and the loss
 2 · U · (T_mean − T_soil) per trench metre, U the standard ``U-Value`` of the
-catalogue (as ``cols.HEAT_LOSS`` in ``compute_network``).
+catalogue and T_soil = 10 °C (as ``cols.HEAT_LOSS`` in ``compute_network``).
 
 The regression range is limited automatically to the DNs the network can
 actually need (smallest allowed DN up to the DN carrying the design load,
@@ -24,7 +24,7 @@ import numpy as np
 import pandas as pd
 
 from fheat_core.algorithms.network import calculate_volumeflow
-from fheat_core.optimization import HOUSE_CONNECTION, STREET_PIPE
+from fheat_core.optimization import HOUSE_CONNECTION, SOIL_TEMPERATURE, STREET_PIPE
 
 logger = logging.getLogger(__name__)
 
@@ -86,7 +86,6 @@ class PipeLinearization:
     capacities: pd.DataFrame
     supply_temperature: float
     return_temperature: float
-    soil_temperature: float
     max_deviation: float
     warnings: tuple[str, ...] = field(default_factory=tuple)
 
@@ -133,13 +132,13 @@ class PipeLinearization:
         return pd.concat(frames, ignore_index=True)
 
 
-def trench_loss(u_value, htemp: float, ltemp: float, soil_temperature: float):
+def trench_loss(u_value, htemp: float, ltemp: float):
     """Heat loss [W/m] of supply and return pipe: 2 · U · (T_mean − T_soil).
 
-    ``u_value`` [W/(m·K)] per pipe (number or Series). With T_soil = 10 °C this
-    is the loss of ``calculate_diameter_velocity_loss`` per hour and metre.
+    ``u_value`` [W/(m·K)] per pipe (number or Series). This is the loss of
+    ``calculate_diameter_velocity_loss`` per hour and metre.
     """
-    return 2 * u_value * ((htemp + ltemp) / 2 - soil_temperature)
+    return 2 * u_value * ((htemp + ltemp) / 2 - SOIL_TEMPERATURE)
 
 
 def pipe_capacities(pipe_info: pd.DataFrame, htemp: float, ltemp: float) -> pd.Series:
@@ -221,7 +220,6 @@ def linearize_pipes(
     design_loads: DesignLoads,
     htemp: float,
     ltemp: float,
-    soil_temperature: float = 10.0,
     max_deviation: float = 0.15,
 ) -> PipeLinearization:
     """Linearise pipe costs and heat losses for house connections and street pipes.
@@ -236,15 +234,13 @@ def linearize_pipes(
         Largest design load [kW] per edge type, see ``glf_terms.design_loads``.
     htemp, ltemp
         Supply and return temperature [°C].
-    soil_temperature
-        Soil temperature [°C] for the loss 2 · U · (T_mean − T_soil) [W/m].
     max_deviation
         A warning is issued for every fit whose relative deviation at one DN
         exceeds this value.
     """
     if min(design_loads.house, design_loads.street) < 0:
         raise ValueError(f"Design loads must not be negative: {design_loads}.")
-    catalogue = _catalogue(pipe_info, pipe_costs, htemp, ltemp, soil_temperature)
+    catalogue = _catalogue(pipe_info, pipe_costs, htemp, ltemp)
     fits: dict[tuple[str, str], LinearFit] = {}
     warnings: list[str] = []
     for edge_type in (HOUSE_CONNECTION, STREET_PIPE):
@@ -262,17 +258,16 @@ def linearize_pipes(
         capacities=catalogue[["DN", "capacity"]].copy(),
         supply_temperature=htemp,
         return_temperature=ltemp,
-        soil_temperature=soil_temperature,
         max_deviation=max_deviation,
         warnings=tuple(warnings),
     )
 
 
-def _catalogue(pipe_info, pipe_costs, htemp, ltemp, soil_temperature) -> pd.DataFrame:
+def _catalogue(pipe_info, pipe_costs, htemp, ltemp) -> pd.DataFrame:
     """Catalogue with cost [€/m], capacity Q_max [kW] and loss [W/m] per DN."""
     catalogue = merge_pipe_costs(pipe_info, pipe_costs).reset_index(drop=True)
     catalogue["capacity"] = pipe_capacities(catalogue, htemp, ltemp)
-    catalogue["loss_w_per_m"] = trench_loss(catalogue["U-Value"], htemp, ltemp, soil_temperature)
+    catalogue["loss_w_per_m"] = trench_loss(catalogue["U-Value"], htemp, ltemp)
     return catalogue
 
 

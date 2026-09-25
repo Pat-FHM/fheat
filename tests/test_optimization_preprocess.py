@@ -634,3 +634,39 @@ class TestNetworkAccess:
         )
         with pytest.raises(ValueError, match="exactly one heat source"):
             simplify_network(G, b, s).source_node()
+
+
+class TestSourceOnStreetNode:
+    """The conftest source lies exactly on the first street vertex."""
+
+    @pytest.fixture
+    def conftest_case(self, buildings_gdf, streets_gdf, source_gdf):
+        from fheat_core.steps.network import prepare_graph
+
+        return prepare_graph(buildings_gdf, streets_gdf, source_gdf)
+
+    def test_own_source_node_with_zero_length_connection(self, conftest_case):
+        G, b, s = conftest_case
+        coord = s.geometry.iloc[0].coords[0]
+        assert G.has_edge(coord, coord)
+        net = simplify_network(G, b, s)
+        src = net.source_node()
+        assert net.node_coords[src] == coord
+        assert net.node_ids[coord] != src
+        (street,) = net.graph.neighbors(src)
+        d = net.graph.edges[src, street]
+        assert d[cols.TYPE] == SOURCE_CONNECTION
+        assert d[cols.LENGTH] == 0.0
+        assert d[FLOW_FROM] == src and d[N_BEHIND] == len(b)
+        assert nx.number_of_selfloops(net.graph) == 0
+
+    def test_shortest_paths_as_dijkstra(self, conftest_case):
+        G, b, s = conftest_case
+        net = simplify_network(G, b, s)
+        src = s.geometry.iloc[0].coords[0]
+        for key, node in net.building_nodes.items():
+            c = b.at[key, cols.CENTROID]
+            before = nx.shortest_path_length(G, src, (c.x, c.y), weight=cols.LENGTH)
+            after = nx.shortest_path_length(net.graph, net.source_node(), node, weight=cols.LENGTH)
+            assert after == pytest.approx(before)
+        _assert_report_balance(G, net)

@@ -84,7 +84,6 @@ class OptimizationConfig:
     heat_cost_eur_per_kwh: float = 0.08      # [€/kWh] Lambert et al. 2024, Tab. 1
 
     # Pre-processing
-    soil_temperature: float = 10.0           # [°C] heat loss 2 · U · (T_mean − T_soil), as F|Heat
     regression_max_deviation: float = 0.15   # warn if a cost/loss line deviates more at one DN
     on_unreachable: str = "warn"             # buildings without a route to the source: "warn" | "error"
 

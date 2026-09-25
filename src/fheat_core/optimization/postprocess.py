@@ -5,11 +5,10 @@ buildings n and summed connection power S [kW]. Per built section:
 
 1. exact simultaneity factor GLF(n) (``calculate_glf``) and design power
    GLF(n) · S [kW];
-2. volume flow and the next larger DN (``calculate_volumeflow``,
-   ``calculate_diameter_velocity_loss``, including its house connection rule);
-3. heat loss [kWh/a] of the DN for both U-values (``linearize.trench_loss``
-   with the soil temperature of the model), pipe investment [€] from the
-   pipe costs of the DN and its annuity [€/a].
+2. volume flow, the next larger DN, velocity and heat loss [kWh/a] for both
+   U-values (``calculate_volumeflow``, ``calculate_diameter_velocity_loss``,
+   including its house connection rule);
+3. pipe investment [€] from the pipe costs of the DN and its annuity [€/a].
 
 The model values (``cols.GLF_MODEL``, ``cols.CAPACITY_MODEL``,
 ``cols.INVEST_COST_MODEL``) stay next to the post-calculated ones. The
@@ -31,7 +30,7 @@ from fheat_core.algorithms.network import (
     calculate_volumeflow,
 )
 from fheat_core.optimization import HOURS_PER_YEAR, SOURCE_CONNECTION
-from fheat_core.optimization.linearize import PipeLinearization, merge_pipe_costs, trench_loss
+from fheat_core.optimization.linearize import PipeLinearization, merge_pipe_costs
 from fheat_core.optimization.preprocess import GEOMETRY, SimplifiedNetwork
 
 logger = logging.getLogger(__name__)
@@ -96,7 +95,7 @@ def _section(row, network, lin, pipe_info, catalogue, pipe_annuity) -> dict:
     glf = calculate_glf(n)
     power_glf = glf * row[cols.THERMAL_POWER]
     volume_flow = calculate_volumeflow(power_glf, htemp, ltemp)
-    dn, velocity, _, _ = calculate_diameter_velocity_loss(
+    dn, velocity, loss, loss_extra = calculate_diameter_velocity_loss(
         volume_flow, htemp, ltemp, length, pipe_info, row[cols.TYPE]
     )
     pipe = catalogue.loc[dn]
@@ -111,8 +110,8 @@ def _section(row, network, lin, pipe_info, catalogue, pipe_annuity) -> dict:
         cols.VOLUME_FLOW: volume_flow,
         cols.NOMINAL_DIAMETER: dn,
         cols.VELOCITY: velocity,
-        cols.HEAT_LOSS: _annual_loss(pipe["U-Value"], lin, length),
-        cols.HEAT_LOSS_EXTRA_INSULATION: _annual_loss(pipe["U-Value_extra_insulation"], lin, length),
+        cols.HEAT_LOSS: loss,
+        cols.HEAT_LOSS_EXTRA_INSULATION: loss_extra,
         cols.GLF_MODEL: row[cols.GLF_MODEL],
         cols.CAPACITY_MODEL: row[cols.CAPACITY_MODEL],
         cols.INVEST_COST_MODEL: row[cols.INVEST_COST_MODEL],
@@ -121,12 +120,6 @@ def _section(row, network, lin, pipe_info, catalogue, pipe_annuity) -> dict:
         "above_largest_dn": volume_flow > pipe["max_volumeFlow"],
         "geometry": _flow_geometry(network, row),
     }
-
-
-def _annual_loss(u_value, lin, length) -> float:
-    """Heat loss [kWh/a] of a section."""
-    w_per_m = trench_loss(u_value, lin.supply_temperature, lin.return_temperature, lin.soil_temperature)
-    return w_per_m * length * HOURS_PER_YEAR / 1000
 
 
 def _flow_geometry(network, row) -> LineString:

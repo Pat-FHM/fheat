@@ -4,7 +4,8 @@ The street graph of ``steps/network.py`` has one node per street vertex. This
 module turns it into the candidate graph of the MILP (block.py) in seven steps:
 
 1. Integer node IDs (Pyomo cannot index by coordinate tuples); the mapping
-   ID ↔ coordinate is kept.
+   ID ↔ coordinate is kept. A source that lies on a street node gets its own
+   node with a source connection of 0 m, as the shortest-path step routes it.
 2. Parts of the graph that cannot reach a heat source are removed. Dead ends
    are removed: every part attached to the rest through a single node that
    contains neither a building nor a source (dead-end streets, loops hanging
@@ -102,7 +103,8 @@ class SimplifiedNetwork:
     ``building_key`` and ``power`` [kW] / ``source_key``; edges carry ``cols.TYPE``,
     ``cols.LENGTH`` [m], ``geometry`` and the bridge attributes.
     ``node_ids`` maps every coordinate of the input graph to its integer ID,
-    ``node_coords`` the other way round.
+    ``node_coords`` the other way round; it also holds the own node of a source
+    on a street node (same coordinate as that street node).
     """
 
     graph: nx.Graph
@@ -160,7 +162,7 @@ def simplify_network(
     )
     H, node_coords, node_ids = _integer_graph(G)
     building_nodes, unreachable = _mark_buildings(H, node_ids, buildings_gdf, power_att)
-    source_nodes = _mark_sources(H, node_ids, source_gdf)
+    source_nodes = _mark_sources(H, node_ids, node_coords, source_gdf)
 
     _remove_disconnected(H, source_nodes.values(), report)
     unreachable += _drop_removed_buildings(H, building_nodes)
@@ -240,7 +242,7 @@ def _mark_buildings(H, node_ids, buildings_gdf, power_att):
     return building_nodes, unreachable
 
 
-def _mark_sources(H, node_ids, source_gdf):
+def _mark_sources(H, node_ids, node_coords, source_gdf):
     source_nodes: dict[Hashable, int] = {}
     for key, row in source_gdf.iterrows():
         coord = row["geometry"].coords[0]
@@ -249,12 +251,30 @@ def _mark_sources(H, node_ids, source_gdf):
             raise ValueError(f"Source {key!r} at {coord} is not connected to the network graph.")
         if H.nodes[node][KIND] != KIND_JUNCTION:
             raise ValueError(f"Source {key!r} at {coord} coincides with another building or source.")
+        if H.has_edge(node, node):
+            node = _detach_source(H, node, node_coords)
         H.nodes[node][KIND] = KIND_SOURCE
         H.nodes[node][SOURCE_KEY] = key
         source_nodes[key] = node
     if not source_nodes:
         raise ValueError("source_gdf is empty: at least one heat source is required.")
     return source_nodes
+
+
+def _detach_source(H, street_node, node_coords) -> int:
+    """Own node for a source on a street node (self-loop of connect_source_to_graph).
+
+    The self-loop becomes a source connection of 0 m to the street node.
+    """
+    coord = node_coords[street_node]
+    data = dict(H.edges[street_node, street_node])
+    H.remove_edge(street_node, street_node)
+    node = max(node_coords) + 1
+    node_coords[node] = coord
+    H.add_node(node, **{COORD: coord, KIND: KIND_JUNCTION})
+    data.update({cols.LENGTH: 0.0, GEOMETRY: LineString([coord, coord])})
+    H.add_edge(node, street_node, **data)
+    return node
 
 
 def _drop_removed_buildings(H, building_nodes) -> list:
