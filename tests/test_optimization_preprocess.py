@@ -7,11 +7,16 @@ Covers:
 - merging of street chains into one edge per section (length, geometry)
 - reduction of parallel sections to the shortest one
 - bridges: detection, fixed flow direction, buildings and power behind
-- total length balance and unchanged shortest paths source → building
+- total length balance and unchanged shortest paths source → building,
+  also on random graphs with dead ends attached to mesh nodes
+- on_unreachable = "warn" | "error"
 
 The graphs are built with the same functions as ``steps/network.py``.
 """
 from __future__ import annotations
+
+import math
+import random
 
 import geopandas as gpd
 import networkx as nx
@@ -252,6 +257,41 @@ class TestDeadEnds:
         G, b, s = line_case
         _assert_shortest_paths_unchanged(G, b, s, simplify_network(G, b, s))
 
+    def test_dead_end_at_mesh_node_keeps_mesh_node(self):
+        """Regression: B carries a dead end but also belongs to the mesh A-B-C-D.
+
+        A(0,0)-B(10,0) and B-C(10,10) are 10 m, A-D(0,10) and D-C 50 m each
+        (via a detour vertex). Source at A, building at C, dead end B-E(20,0).
+        Removing B together with its dead end raised the path 30 m → 110 m.
+        """
+        dx = math.sqrt(25 ** 2 - 5 ** 2)  # detour vertex: two 25 m segments
+        G, b, s = _graph(
+            streets=[
+                [(0, 0), (10, 0)],
+                [(10, 0), (10, 10)],
+                [(0, 0), (-dx, 5), (0, 10)],
+                [(0, 10), (5, 10 + dx), (10, 10)],
+                [(10, 0), (20, 0)],
+            ],
+            buildings=[((15, 10), (10, 10), 10.0)],
+            sources=[((-5, 0), (0, 0))],
+        )
+        assert nx.shortest_path_length(G, (-5, 0), (15, 10), weight=cols.LENGTH) == pytest.approx(30)
+        net = simplify_network(G, b, s)
+        coords = {net.node_coords[n] for n in net.graph}
+        assert (20, 0) not in coords
+        assert net.report.dead_end_length_removed == pytest.approx(10)
+        # without the dead end B is a plain street vertex: A-B-C becomes one
+        # 20 m section, which makes the 100 m detour via D parallel to it
+        a, c = net.node_ids[(0, 0)], net.node_ids[(10, 10)]
+        assert net.graph.edges[a, c][cols.LENGTH] == pytest.approx(20)
+        assert list(net.graph.edges[a, c][GEOMETRY].coords) in (
+            [(0, 0), (10, 0), (10, 10)], [(10, 10), (10, 0), (0, 0)]
+        )
+        assert net.report.parallel_length_removed == pytest.approx(100)
+        _assert_shortest_paths_unchanged(G, b, s, net)
+        _assert_length_balance(G, net)
+
 
 class TestMergeChains:
     def test_one_edge_per_section(self, ring_case):
@@ -429,6 +469,37 @@ class TestUnreachable:
         assert any("cannot be reached" in r.getMessage() for r in caplog.records)
         _assert_length_balance(G, net)
 
+    def test_warning_names_building_ids(self, caplog):
+        G, b, s = _graph(
+            streets=[[(0, 0), (50, 0)], [(200, 0), (250, 0)]],
+            buildings=[((50, 10), (50, 0), 10.0), ((250, 10), (250, 0), 10.0)],
+            sources=[((-10, 0), (0, 0))],
+        )
+        b[cols.BUILDING_ID] = ["B-17", "B-42"]
+        with caplog.at_level("WARNING", logger="fheat_core.optimization.preprocess"):
+            simplify_network(G, b, s, on_unreachable="warn")
+        (msg,) = [r.getMessage() for r in caplog.records if "cannot be reached" in r.getMessage()]
+        assert "B-42" in msg and "B-17" not in msg
+
+    def test_error_mode_raises(self):
+        G, b, s = _graph(
+            streets=[[(0, 0), (50, 0)], [(200, 0), (250, 0)]],
+            buildings=[((50, 10), (50, 0), 10.0), ((250, 10), (250, 0), 10.0)],
+            sources=[((-10, 0), (0, 0))],
+        )
+        with pytest.raises(ValueError, match="cannot be reached"):
+            simplify_network(G, b, s, on_unreachable="error")
+
+    def test_error_mode_passes_when_all_reachable(self, ring_case):
+        G, b, s = ring_case
+        net = simplify_network(G, b, s, on_unreachable="error")
+        assert net.unreachable_buildings == []
+
+    def test_invalid_mode_raises(self, ring_case):
+        G, b, s = ring_case
+        with pytest.raises(ValueError, match="on_unreachable"):
+            simplify_network(G, b, s, on_unreachable="ignore")
+
 
 class TestInputErrors:
     def test_duplicate_centroid_raises(self, ring_case):
@@ -510,3 +581,99 @@ class TestPipelineGraph:
         assert again.report.dead_end_edges_removed == 0
         assert again.report.parallel_edges_removed == 0
         assert again.report.nodes_merged == 0
+
+
+# ---------------------------------------------------------------------------
+# random graphs
+# ---------------------------------------------------------------------------
+
+
+def _random_case(seed):
+    """Irregular mesh with dead ends (chains, branches, loops) at mesh nodes.
+
+    Buildings sit on mesh nodes and dead-end nodes; some dead ends and some
+    mesh parts stay without buildings, some buildings end up unreachable.
+    """
+    rng = random.Random(seed)
+    m = rng.randint(3, 6)
+    pos = {
+        (i, j): (i * 50 + rng.uniform(-10, 10), j * 50 + rng.uniform(-10, 10))
+        for i in range(m) for j in range(m)
+    }
+    streets = []
+    for i in range(m):
+        for j in range(m):
+            for di, dj in ((1, 0), (0, 1)):
+                if (i + di, j + dj) in pos and rng.random() < 0.75:
+                    streets.append([pos[i, j], pos[i + di, j + dj]])
+    mesh = sorted({p for line in streets for p in line})
+    if not mesh:
+        return _random_case(seed + 1000)
+
+    dead_end_nodes = []
+    for _ in range(rng.randint(1, 3 * m)):
+        base = rng.choice(mesh)
+        chain = [base]
+        for _ in range(rng.randint(1, 3)):
+            x, y = chain[-1]
+            chain.append((x + rng.uniform(-20, 20), y + rng.uniform(-20, 20)))
+        streets.append(chain)
+        dead_end_nodes += chain[1:]
+        roll = rng.random()
+        if roll < 0.3:                       # branch off the dead end
+            x, y = rng.choice(chain[1:])
+            branch = [(x, y), (x + rng.uniform(-15, 15), y + rng.uniform(-15, 15))]
+            streets.append(branch)
+            dead_end_nodes.append(branch[1])
+        elif roll < 0.5:                     # loop at the end of the dead end
+            x, y = chain[-1]
+            a = (x + rng.uniform(5, 15), y + rng.uniform(5, 15))
+            c = (x - rng.uniform(5, 15), y + rng.uniform(5, 15))
+            streets.append([chain[-1], a, c, chain[-1]])
+            dead_end_nodes += [a, c]
+
+    candidates = mesh + dead_end_nodes
+    buildings = []
+    for k in range(rng.randint(1, 8)):
+        x, y = rng.choice(candidates)
+        buildings.append(((x + 3 + 0.01 * k, y + 4), (x, y), rng.uniform(5, 50)))
+    x, y = rng.choice(mesh)
+    sources = [((x - 7, y - 3), (x, y))]
+    return _graph(streets, buildings, sources)
+
+
+class TestRandomGraphs:
+    @staticmethod
+    def _simplify(G, b, s):
+        src = s.geometry.iloc[0].coords[0]
+        if not any(nx.has_path(G, src, (c.x, c.y)) for c in b[cols.CENTROID] if (c.x, c.y) in G):
+            with pytest.raises(ValueError, match="No building"):
+                simplify_network(G, b, s)
+            return None
+        return simplify_network(G, b, s)
+
+    @pytest.mark.parametrize("seed", range(60))
+    def test_shortest_paths_unchanged(self, seed):
+        G, b, s = _random_case(seed)
+        net = self._simplify(G, b, s)
+        if net is None:
+            return
+        _assert_shortest_paths_unchanged(G, b, s, net)
+        src = s.geometry.iloc[0].coords[0]
+        for key in net.unreachable_buildings:
+            c = b.at[key, cols.CENTROID]
+            assert not nx.has_path(G, src, (c.x, c.y))
+
+    @pytest.mark.parametrize("seed", range(60))
+    def test_structure(self, seed):
+        G, b, s = _random_case(seed)
+        net = self._simplify(G, b, s)
+        if net is None:
+            return
+        _assert_length_balance(G, net)
+        _assert_bridges_match_brute_force(net)
+        H = net.graph
+        for n, kind in H.nodes(data=KIND):
+            if kind == KIND_JUNCTION:
+                assert H.degree(n) >= 2, n
+        assert nx.number_of_selfloops(H) == 0

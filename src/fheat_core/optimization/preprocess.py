@@ -15,7 +15,10 @@ module turns it into the candidate graph of the MILP:
 5. Parallel sections between the same two nodes are reduced to the shortest
    one (R3); self-loops created by step 4 are removed.
 6. Bridges are identified. For every bridge the side without a source is
-   known, hence also the flow direction and the buildings behind it.
+   known, hence also the flow direction and the buildings behind it. With
+   all buildings connected (forced mode) number and power behind a bridge
+   are exact; in the economic mode they are only upper bounds, the direction
+   stays fixed.
 
 Steps 3 to 5 do not change the optimum of the MILP: removed parts contain no
 building or source, so a cost-minimal tree never uses them, and of two
@@ -57,6 +60,8 @@ FLOW_FROM = "flow_from"         # fixed flow direction of a bridge (None if not 
 FLOW_TO = "flow_to"
 N_BEHIND = "n_behind"           # buildings behind a bridge in flow direction
 POWER_BEHIND = "power_behind"   # summed connection power behind a bridge [kW]
+
+_ON_UNREACHABLE = frozenset({"warn", "error"})
 
 
 @dataclass
@@ -117,12 +122,23 @@ def simplify_network(
     buildings_gdf: gpd.GeoDataFrame,
     source_gdf: gpd.GeoDataFrame,
     power_att: str = cols.THERMAL_POWER,
+    on_unreachable: str = "warn",
 ) -> SimplifiedNetwork:
     """Simplify the street graph built by ``steps/network.py``.
 
     Buildings are identified by their centroid (as in ``compute_network``),
     sources by their point geometry. ``G`` is not modified.
+
+    Buildings that cannot be reached from a heat source are left out and
+    listed in ``unreachable_buildings`` (index of ``buildings_gdf``). With
+    ``on_unreachable="warn"`` a warning names their IDs, with ``"error"`` a
+    ``ValueError`` is raised instead.
     """
+    if on_unreachable not in _ON_UNREACHABLE:
+        raise ValueError(
+            f"on_unreachable '{on_unreachable}' is not allowed. "
+            f"Allowed values: {sorted(_ON_UNREACHABLE)}"
+        )
     report = SimplificationReport(
         nodes_before=G.number_of_nodes(),
         edges_before=G.number_of_edges(),
@@ -147,6 +163,14 @@ def simplify_network(
         if node not in H:
             unreachable.append(key)
             del building_nodes[key]
+    if unreachable:
+        ids = _building_ids(buildings_gdf, unreachable)
+        msg = f"{len(unreachable)} building(s) cannot be reached from a heat source: {ids}"
+        if on_unreachable == "error":
+            raise ValueError(msg)
+        logger.warning("%s; they are not part of the network.", msg)
+    if not building_nodes:
+        raise ValueError("No building can be reached from a heat source: there is no network to optimise.")
     _check_leaves(H, building_nodes, source_nodes)
 
     while True:
@@ -164,11 +188,6 @@ def simplify_network(
     report.unreachable_buildings = len(unreachable)
 
     logger.info("Graph simplification: %s", report.as_dict())
-    if unreachable:
-        logger.warning(
-            "%d building(s) cannot be reached from a heat source and are ignored: %s",
-            len(unreachable), unreachable,
-        )
 
     return SimplifiedNetwork(
         graph=H,
@@ -208,6 +227,13 @@ def _mark_buildings(H, node_ids, buildings_gdf, power_att):
         building_nodes[key] = node
         power[key] = float(row[power_att])
     return building_nodes, power, unreachable
+
+
+def _building_ids(buildings_gdf, keys) -> list:
+    """``building_id`` of the given rows if the column exists, else their index."""
+    if cols.BUILDING_ID in buildings_gdf.columns:
+        return buildings_gdf.loc[keys, cols.BUILDING_ID].tolist()
+    return list(keys)
 
 
 def _mark_sources(H, node_ids, source_gdf):
@@ -262,8 +288,8 @@ def _remove_dead_ends(H, sources, report):
     """Remove every part attached through one node without building or source.
 
     Uses the block-cut tree: rooted at a source, every subtree without a
-    terminal (building or source) is dropped. Articulation points that still
-    lead to a terminal are kept.
+    terminal (building or source) is dropped. An articulation point belongs to
+    its parent block as well and is only dropped together with that block.
     """
     terminals = {n for n, k in H.nodes(data=KIND) if k != KIND_JUNCTION}
     cut_nodes = set(nx.articulation_points(H))
@@ -298,7 +324,14 @@ def _remove_dead_ends(H, sources, report):
             has_terminal[t] = has_terminal.get(t, False) or bool(own_nodes(t) & terminals)
             if has_terminal[t] and t in parent:
                 has_terminal[parent[t]] = True
-        drop |= {n for t, keep in has_terminal.items() if not keep for n in own_nodes(t)}
+        for t, keep in has_terminal.items():
+            if keep:
+                continue
+            if t[0] == "block":
+                drop |= own_nodes(t)
+            # a cut node also belongs to its parent block: drop it only with that block
+            elif not has_terminal[parent[t]]:
+                drop.add(t[1])
     if not drop:
         return
     removed = [(u, v, d) for u, v, d in H.edges(drop, data=True)]
