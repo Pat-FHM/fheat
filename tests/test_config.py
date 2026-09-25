@@ -85,6 +85,7 @@ class TestOptimizationConfig:
         assert cfg.heat_cost_eur_per_kwh == 0.08
         assert (cfg.mip_abs_gap, cfg.time_limit_s) == ("auto", 300.0)
         assert cfg.glf_mode == "referenz"
+        assert (cfg.mode, cfg.heat_price_eur_per_kwh) == ("erzwungen", None)
         assert (cfg.regression_max_deviation, cfg.on_unreachable) == (0.15, "warn")
 
     @pytest.mark.parametrize("kwargs, match", [
@@ -95,6 +96,10 @@ class TestOptimizationConfig:
         ({"source_capex_eur_per_kw": -1.0}, "source_capex_eur_per_kw"),
         ({"heat_cost_eur_per_kwh": -0.1}, "heat_cost_eur_per_kwh"),
         ({"glf_mode": "tangente"}, "glf_mode"),
+        ({"mode": "teilweise"}, "mode"),
+        ({"mode": "wirtschaftlich"}, "needs heat_price_eur_per_kwh"),
+        ({"heat_price_eur_per_kwh": 0.15}, "only used in mode"),
+        ({"mode": "wirtschaftlich", "heat_price_eur_per_kwh": -0.1}, "must not be negative"),
         ({"on_unreachable": "ignore"}, "on_unreachable"),
         ({"regression_max_deviation": 0.0}, "regression_max_deviation"),
         ({"mip_abs_gap": "fast"}, "mip_abs_gap"),
@@ -133,3 +138,9 @@ class TestNetworkMethod:
     def test_unknown_method_raises(self):
         with pytest.raises(ValueError, match="network_method"):
             FHeatConfig(network_method="steiner")
+
+    def test_economic_mode_with_heat_price(self):
+        from fheat_core.config import OptimizationConfig
+
+        cfg = OptimizationConfig(mode="wirtschaftlich", heat_price_eur_per_kwh=0.15)
+        assert (cfg.mode, cfg.heat_price_eur_per_kwh) == ("wirtschaftlich", 0.15)

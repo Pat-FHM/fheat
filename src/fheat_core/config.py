@@ -3,7 +3,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import ClassVar, Optional
 
-from fheat_core.optimization import GLF_OFF, GLF_REFERENCE, ON_UNREACHABLE
+from fheat_core.optimization import (
+    GLF_OFF,
+    GLF_REFERENCE,
+    MODE_ECONOMIC,
+    MODE_FORCED,
+    ON_UNREACHABLE,
+)
 
 
 @dataclass
@@ -72,6 +78,11 @@ class OptimizationConfig:
     be replaced by project-specific values.
     """
 
+    # Which buildings: "erzwungen" (every reachable one) or "wirtschaftlich"
+    # (if the revenue pays for it; needs heat_price_eur_per_kwh)
+    mode: str = MODE_FORCED
+    heat_price_eur_per_kwh: Optional[float] = None   # [€/kWh] revenue, economic mode only
+
     # Simultaneity in the route choice: "referenz" (exact on bridges,
     # reference-tree GLF elsewhere) or "aus" (no GLF, same cost line, for comparison)
     glf_mode: str = GLF_REFERENCE
@@ -91,10 +102,12 @@ class OptimizationConfig:
     mip_abs_gap: float | str = "auto"        # [€/a]; "auto": 0.5 % of the pipe annuity of the shortest-path tree
     time_limit_s: float = 300.0
 
+    _ALLOWED_MODES: ClassVar[frozenset] = frozenset({MODE_FORCED, MODE_ECONOMIC})
     _ALLOWED_GLF_MODES: ClassVar[frozenset] = frozenset({GLF_REFERENCE, GLF_OFF})
     _ALLOWED_ON_UNREACHABLE: ClassVar[frozenset] = ON_UNREACHABLE
 
     def __post_init__(self) -> None:
+        self._check_mode()
         if self.glf_mode not in self._ALLOWED_GLF_MODES:
             raise ValueError(
                 f"glf_mode '{self.glf_mode}' is not allowed. "
@@ -123,3 +136,18 @@ class OptimizationConfig:
             raise ValueError(
                 f"mip_abs_gap ({self.mip_abs_gap!r}) must be 'auto' or a non-negative number [€/a]."
             )
+
+    def _check_mode(self) -> None:
+        if self.mode not in self._ALLOWED_MODES:
+            raise ValueError(
+                f"mode '{self.mode}' is not allowed. Allowed values: {sorted(self._ALLOWED_MODES)}"
+            )
+        if self.mode == MODE_ECONOMIC and self.heat_price_eur_per_kwh is None:
+            raise ValueError(f"mode '{MODE_ECONOMIC}' needs heat_price_eur_per_kwh [€/kWh].")
+        if self.mode == MODE_FORCED and self.heat_price_eur_per_kwh is not None:
+            raise ValueError(
+                f"heat_price_eur_per_kwh is only used in mode '{MODE_ECONOMIC}'; "
+                f"remove it or set mode='{MODE_ECONOMIC}'."
+            )
+        if self.heat_price_eur_per_kwh is not None and self.heat_price_eur_per_kwh < 0:
+            raise ValueError(f"heat_price_eur_per_kwh ({self.heat_price_eur_per_kwh}) must not be negative.")

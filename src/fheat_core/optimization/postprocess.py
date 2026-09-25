@@ -39,27 +39,28 @@ _NET_COLUMNS = [
     cols.TYPE, cols.LENGTH, cols.THERMAL_POWER, cols.N_BUILDINGS, cols.GLF,
     cols.THERMAL_POWER_GLF, cols.VOLUME_FLOW, cols.NOMINAL_DIAMETER, cols.VELOCITY,
     cols.HEAT_LOSS, cols.HEAT_LOSS_EXTRA_INSULATION,
-    cols.GLF_MODEL, cols.CAPACITY_MODEL, cols.INVEST_COST_MODEL, cols.INVEST_COST, cols.ANNUAL_COST,
+    cols.GLF_MODEL, cols.GLF_MODEL_ESTIMATED, cols.CAPACITY_MODEL, cols.INVEST_COST_MODEL, cols.INVEST_COST, cols.ANNUAL_COST,
 ]
 
 
 @dataclass(frozen=True)
 class PostCalculation:
-    """Totals of the post-calculation."""
+    """Totals of the post-calculation; deviations are None without a built section."""
 
     producer_capacity: float        # GLF(N) · ΣQ + heat loss [kW]
     heat_loss: float                # [kW], standard U-value
     invest_cost: float              # pipe investment of the chosen DNs [€]
     invest_cost_model: float        # linearised pipe investment of the MILP [€]
     annual_cost: float              # annuity of the pipe investment [€/a]
-    glf_max_deviation: float        # max |GLF_model / GLF − 1| over the built sections
-    capacity_max_deviation: float   # max |C_model / (GLF · S) − 1| over the built sections
+    glf_max_deviation: float | None       # max |GLF_model / GLF − 1| over the built sections
+    glf_estimated_sections: int           # built sections whose GLF_model is an estimate
+    capacity_max_deviation: float | None  # max |C_model / (GLF · S) − 1| over the built sections
     sections_above_largest_dn: int  # design power above the largest DN of the catalogue
 
     @property
-    def cost_line_deviation(self) -> float:
+    def cost_line_deviation(self) -> float | None:
         """Linearised over real pipe investment minus 1; negative: the cost line is too low."""
-        return self.invest_cost_model / self.invest_cost - 1
+        return self.invest_cost_model / self.invest_cost - 1 if self.invest_cost else None
 
 
 def postprocess(
@@ -74,14 +75,15 @@ def postprocess(
     """``net_gdf`` of the built sections (``NetSchema``) and the totals.
 
     ``edges`` is ``MilpResult.edges``, ``pipe_annuity`` the annuity factor of
-    the pipes [1/a]. Geometries point in flow direction.
+    the pipes [1/a]. Geometries point in flow direction. Without a built
+    section (economic mode, nothing pays) ``net_gdf`` is empty.
     """
     catalogue = merge_pipe_costs(pipe_info, pipe_costs).set_index("DN")
     built = edges[edges["built"]].to_dict("records")
     rows = [_section(row, network, linearization, pipe_info, catalogue, pipe_annuity) for row in built]
     net_gdf = gpd.GeoDataFrame(
-        [{k: row[k] for k in _NET_COLUMNS} for row in rows],
-        geometry=[row["geometry"] for row in rows],
+        pd.DataFrame([{k: row[k] for k in _NET_COLUMNS} for row in rows], columns=_NET_COLUMNS),
+        geometry=gpd.GeoSeries([row["geometry"] for row in rows], crs=crs),
         crs=crs,
     )
     return net_gdf, _totals(net_gdf, rows)
@@ -113,6 +115,7 @@ def _section(row, network, lin, pipe_info, catalogue, pipe_annuity) -> dict:
         cols.HEAT_LOSS: loss,
         cols.HEAT_LOSS_EXTRA_INSULATION: loss_extra,
         cols.GLF_MODEL: row[cols.GLF_MODEL],
+        cols.GLF_MODEL_ESTIMATED: row[cols.GLF_MODEL_ESTIMATED],
         cols.CAPACITY_MODEL: row[cols.CAPACITY_MODEL],
         cols.INVEST_COST_MODEL: row[cols.INVEST_COST_MODEL],
         cols.INVEST_COST: invest,
@@ -130,6 +133,8 @@ def _flow_geometry(network, row) -> LineString:
 
 
 def _totals(net_gdf, rows) -> PostCalculation:
+    if net_gdf.empty:
+        return PostCalculation(0.0, 0.0, 0.0, 0.0, 0.0, None, 0, None, 0)
     loss_kw = net_gdf[cols.HEAT_LOSS].sum() / HOURS_PER_YEAR
     source = net_gdf[net_gdf[cols.TYPE] == SOURCE_CONNECTION].iloc[0]
     above = sum(row["above_largest_dn"] for row in rows)
@@ -142,6 +147,7 @@ def _totals(net_gdf, rows) -> PostCalculation:
         invest_cost_model=float(net_gdf[cols.INVEST_COST_MODEL].sum()),
         annual_cost=float(net_gdf[cols.ANNUAL_COST].sum()),
         glf_max_deviation=float((net_gdf[cols.GLF_MODEL] / net_gdf[cols.GLF] - 1).abs().max()),
+        glf_estimated_sections=int(net_gdf[cols.GLF_MODEL_ESTIMATED].sum()),
         capacity_max_deviation=float(
             (net_gdf[cols.CAPACITY_MODEL] / net_gdf[cols.THERMAL_POWER_GLF] - 1).abs().max()
         ),

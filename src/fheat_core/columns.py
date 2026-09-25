@@ -78,6 +78,7 @@ GLF = "glf"                          # simultaneity factor
 # optional, network_method = "milp": model values next to the post-calculation
 CAPACITY_MODEL = "capacity_model"        # design capacity in the MILP [kW]
 GLF_MODEL = "glf_model"                  # simultaneity factor used in the MILP
+GLF_MODEL_ESTIMATED = "glf_model_estimated"  # True: glf_model is an estimate, not exact
 INVEST_COST_MODEL = "invest_cost_model"  # linearised pipe investment of the MILP [€]
 INVEST_COST = "invest_cost"              # pipe investment of the chosen DN [€]
 ANNUAL_COST = "annual_cost"              # annuity of the pipe investment [€/a]
@@ -174,6 +175,7 @@ LABELS_DE: dict[str, str] = {
     GLF: "GLF",
     CAPACITY_MODEL: "Kapazitaet_Modell [kW]",
     GLF_MODEL: "GLF_Modell",
+    GLF_MODEL_ESTIMATED: "GLF_Modell_geschaetzt",
     INVEST_COST_MODEL: "Investition_Modell [EUR]",
     INVEST_COST: "Investition [EUR]",
     ANNUAL_COST: "Annuitaet [EUR/a]",

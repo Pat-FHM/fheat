@@ -9,6 +9,8 @@ Covers:
 - orchestrator: all steps, result summary with milp_* key figures,
   save_outputs() with German labels
 - adapter pipe costs (provide_pipe_costs) replace the bundled ones
+- T9 economic mode: a far, small building gets connect = 0 and the status
+  "wirtschaftlich nicht angeschlossen"
 """
 from __future__ import annotations
 
@@ -21,7 +23,7 @@ pytest.importorskip("oemof.solph")
 
 from fheat_core import columns as cols  # noqa: E402
 from fheat_core.config import FHeatConfig, OptimizationConfig  # noqa: E402
-from fheat_core.optimization import STATUS_CONNECTED, STATUS_UNREACHABLE  # noqa: E402
+from fheat_core.optimization import STATUS_CONNECTED, STATUS_NOT_ECONOMIC, STATUS_UNREACHABLE  # noqa: E402
 from fheat_core.optimization.network import NetworkResult, OptimizationReport, build_network  # noqa: E402
 from fheat_core.orchestrator import FHeatOrchestrator  # noqa: E402
 from fheat_core.resources import load_pipe_costs  # noqa: E402
@@ -172,3 +174,77 @@ class TestOrchestrator:
         assert orch.state.optimization_report is None
         assert cols.CONNECTION_STATUS not in orch.state.buildings_gdf.columns
         assert not any(k.startswith("milp_") for k in orch.state.result_summary)
+
+
+@pytest.fixture
+def t9_area(parcels_gdf, source_gdf):
+    """Three large buildings (300 MWh/a) at the start of the street, one small
+    building (10 MWh/a) at the end of a 2.8 km extension."""
+    buildings = gpd.GeoDataFrame(
+        {
+            cols.BUILDING_ID: [0, 1, 2, 3],
+            cols.CONNECT: [1, 1, 1, 1],
+            cols.HEAT_DEMAND: [300000.0, 300000.0, 300000.0, 10000.0],
+            cols.THERMAL_POWER: [150.0, 150.0, 150.0, 5.0],
+            cols.FULL_LOAD_HOURS: [2000.0] * 4,
+            cols.LOAD_PROFILE: ["MFH"] * 4,
+            "geometry": [Polygon([(x, 0), (x + 10, 0), (x + 10, 10), (x, 10)]) for x in (0, 50, 100, 2995)],
+        },
+        crs=CRS,
+    )
+    streets = gpd.GeoDataFrame(
+        {cols.ROUTABLE: [1, 1], "geometry": [LineString([(-10, -5), (200, -5)]), LineString([(200, -5), (3000, -5)])]},
+        crs=CRS,
+    )
+    return buildings, streets, source_gdf, StubAdapter(buildings, streets, parcels_gdf, source_gdf)
+
+
+class TestT9EconomicStep:
+    @staticmethod
+    def _cfg(tmp_path):
+        return FHeatConfig(
+            network_method="milp", output_dir=str(tmp_path),
+            optimization=OptimizationConfig(mode="wirtschaftlich", heat_price_eur_per_kwh=0.15),
+        )
+
+    def test_connect_zero_written_back(self, t9_area, tmp_path):
+        buildings, streets, source, adapter = t9_area
+        state = network.run(_state(buildings, streets, source), self._cfg(tmp_path), adapter)
+        b = state.buildings_gdf.set_index(cols.BUILDING_ID)
+        assert list(b[cols.CONNECT]) == [1, 1, 1, 0]
+        assert list(b[cols.CONNECTION_STATUS]) == [STATUS_CONNECTED] * 3 + [STATUS_NOT_ECONOMIC]
+        assert state.optimization_report.not_connected_economic == [3]
+
+    def test_summary(self, t9_area, tmp_path):
+        buildings, streets, source, adapter = t9_area
+        state = network.run(_state(buildings, streets, source), self._cfg(tmp_path), adapter)
+        summary = state.optimization_report.summary()
+        assert summary["milp_mode"] == "wirtschaftlich"
+        assert (summary["milp_connected_buildings"], summary["milp_not_connected_economic"]) == (3, 1)
+        assert summary["milp_revenue_eur_a"] == pytest.approx(0.15 * 900000.0, rel=1e-6)
+        assert summary["milp_glf_estimated_sections"] >= 1
+
+    def test_forced_mode_connects_all(self, t9_area, milp_cfg):
+        buildings, streets, source, adapter = t9_area
+        state = network.run(_state(buildings, streets, source), milp_cfg, adapter)
+        assert list(state.buildings_gdf[cols.CONNECT]) == [1, 1, 1, 1]
+        assert state.optimization_report.summary()["milp_revenue_eur_a"] == 0.0
+
+    def test_nothing_pays_gives_empty_network(self, t9_area, tmp_path, caplog):
+        buildings, streets, source, adapter = t9_area
+        cfg = FHeatConfig(
+            network_method="milp", output_dir=str(tmp_path),
+            optimization=OptimizationConfig(mode="wirtschaftlich", heat_price_eur_per_kwh=0.0),
+        )
+        orch = FHeatOrchestrator(config=cfg, adapter=adapter)
+        with caplog.at_level("WARNING", logger="fheat_core.optimization.network"):
+            orch.run_all()
+        assert orch.state.net_gdf.empty
+        NetSchema.validate(orch.state.net_gdf)
+        assert (orch.state.buildings_gdf[cols.CONNECTION_STATUS] == STATUS_NOT_ECONOMIC).all()
+        assert (orch.state.buildings_gdf[cols.CONNECT] == 0).all()
+        summary = orch.state.result_summary
+        assert summary["milp_connected_buildings"] == 0
+        assert summary["milp_cost_line_deviation"] is None and summary["milp_glf_max_deviation"] is None
+        assert any("no building pays" in r.getMessage() for r in caplog.records)
+        assert "netz" not in orch.save_outputs()

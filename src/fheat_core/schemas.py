@@ -170,6 +170,7 @@ NetSchema = FrameSchema(
         cols.GLF: "float",
         cols.CAPACITY_MODEL: "float",
         cols.GLF_MODEL: "float",
+        cols.GLF_MODEL_ESTIMATED: "bool",
         cols.INVEST_COST_MODEL: "float",
         cols.INVEST_COST: "float",
         cols.ANNUAL_COST: "float",

@@ -28,7 +28,7 @@ import networkx as nx
 
 from fheat_core import columns as cols
 from fheat_core.algorithms.network import calculate_glf
-from fheat_core.optimization import GLF_OFF
+from fheat_core.optimization import GLF_OFF, MODE_FORCED
 from fheat_core.optimization.linearize import DesignLoads
 from fheat_core.optimization.preprocess import N_BEHIND, POWER, SimplifiedNetwork, edge_key
 
@@ -84,6 +84,20 @@ def glf_factors(network: SimplifiedNetwork, tree: ReferenceTree, glf_mode: str) 
     if glf_mode == GLF_OFF:
         return {edge_key(u, v): 1.0 for u, v in H.edges}
     return {edge_key(u, v): calculate_glf(_buildings_behind(u, v, d, tree)) for u, v, d in H.edges(data=True)}
+
+
+def glf_estimated(network: SimplifiedNetwork, glf_mode: str, mode: str) -> dict:
+    """Per section (:func:`edge_key`): is g_e an estimate rather than the exact GLF?
+
+    Exact only with ``glf_mode = "referenz"`` on a bridge with a fixed
+    direction whose number of buildings behind is known: always in the forced
+    mode, in the economic mode only with one building behind (the upper bound
+    is then the value).
+    """
+    return {
+        edge_key(u, v): glf_mode == GLF_OFF or d[N_BEHIND] is None or (mode != MODE_FORCED and d[N_BEHIND] > 1)
+        for u, v, d in network.graph.edges(data=True)
+    }
 
 
 def _buildings_behind(u, v, data, tree) -> int:

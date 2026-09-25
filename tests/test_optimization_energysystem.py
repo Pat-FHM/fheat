@@ -11,6 +11,8 @@ Covers:
 - simultaneity: C = g · S per section, producer sized with GLF(N) · ΣQ
 - T6 the GLF changes the route: two clusters get separate feeders without
   GLF and a shared trunk with GLF (variant B)
+- economic mode: the tree supplies exactly the connected buildings, revenue
+  in the objective, T9 a far, small building stays unconnected
 - objective terms, fixed bridges, mip_abs_gap "auto" (only absolute gap),
   time limit, errors
 """
@@ -32,7 +34,13 @@ from fheat_core.algorithms.network import (  # noqa: E402
 )
 from fheat_core.config import OptimizationConfig  # noqa: E402
 from fheat_core.algorithms.network import calculate_glf  # noqa: E402
-from fheat_core.optimization import GLF_OFF, GLF_REFERENCE, HOURS_PER_YEAR, HOUSE_CONNECTION  # noqa: E402
+from fheat_core.optimization import (  # noqa: E402
+    GLF_OFF,
+    GLF_REFERENCE,
+    HOURS_PER_YEAR,
+    HOUSE_CONNECTION,
+    MODE_ECONOMIC,
+)
 from fheat_core.optimization.energysystem import (  # noqa: E402
     MIP_ABS_GAP_AUTO_SHARE,
     solve_network,
@@ -295,3 +303,89 @@ class TestSolver:
         )
         with pytest.raises(ValueError, match="more than the largest DN"):
             _solve(G, b, s)
+
+
+# ---------------------------------------------------------------------------
+# economic mode
+# ---------------------------------------------------------------------------
+
+PRICE = 0.15   # [€/kWh]
+
+
+def _economic(G, b, s):
+    return _solve(G, b, s, mode=MODE_ECONOMIC, heat_price_eur_per_kwh=PRICE)
+
+
+def _t9_graph():
+    """Three large buildings (150 kW) within 100 m of the source, one small
+    building (5 kW) at the end of a 2.9 km street."""
+    return street_graph(
+        streets=[[(0, 0), (30, 0), (60, 0), (100, 0)], [(100, 0), (3000, 0)]],
+        buildings=[((30, 10), (30, 0), 150.0), ((60, 10), (60, 0), 150.0),
+                   ((100, 10), (100, 0), 150.0), ((3000, 10), (3000, 0), 5.0)],
+        sources=[((-5, 0), (0, 0))],
+    )
+
+
+class TestT9Economic:
+    def test_far_small_building_not_connected(self):
+        net, _, res = _economic(*_t9_graph())
+        assert res.mode == MODE_ECONOMIC
+        assert sorted(res.connected) == [0, 1, 2]
+        far = net.building_nodes[3]
+        assert far not in _built_tree(res).nodes
+
+    def test_forced_mode_connects_it(self):
+        _, _, res = _solve(*_t9_graph())
+        assert sorted(res.connected) == [0, 1, 2, 3]
+
+    def test_revenue_in_objective(self):
+        _, _, res = _economic(*_t9_graph())
+        parts = res.objective_parts
+        assert parts.revenue == pytest.approx(PRICE * HOURS_PER_YEAR * res.demand_flow)
+        assert res.demand_flow == pytest.approx(3 * 150.0 * FULL_LOAD_HOURS / HOURS_PER_YEAR)
+        assert parts.total == pytest.approx(res.objective)
+        assert res.objective < 0
+
+    def test_glf_on_bridges_is_an_estimate(self):
+        net, _, res = _economic(*_t9_graph())
+        e = res.edges
+        houses = e[e[cols.TYPE] == HOUSE_CONNECTION]
+        assert not houses[cols.GLF_MODEL_ESTIMATED].any()
+        src = e[e[cols.TYPE] == "Quellenanschluss"].iloc[0]
+        assert bool(src[cols.GLF_MODEL_ESTIMATED])
+        assert src[cols.GLF_MODEL] == pytest.approx(calculate_glf(4))
+        assert src[cols.N_BUILDINGS] == pytest.approx(3)
+
+    def test_forced_mode_glf_on_bridges_is_exact(self):
+        _, _, res = _solve(*_t9_graph())
+        e = res.edges
+        assert not e.loc[e["fixed"], cols.GLF_MODEL_ESTIMATED].any()
+
+
+@pytest.mark.parametrize("seed", range(10))
+class TestEconomicRandomNetworks:
+    def test_tree_supplies_exactly_the_connected_buildings(self, seed):
+        net, _, res = _economic(*random_case(seed))
+        tree = _built_tree(res)
+        connected = {net.building_nodes[k] for k in res.connected}
+        if not connected:
+            assert tree.number_of_nodes() == 0
+            return
+        assert nx.is_arborescence(tree)
+        assert [n for n, d in tree.in_degree() if d == 0] == [net.source_node()]
+        assert set(net.building_nodes.values()) & set(tree.nodes) == connected
+
+    def test_energy_balance(self, seed):
+        net, _, res = _economic(*random_case(seed))
+        powers = sum(net.graph.nodes[net.building_nodes[k]][POWER] for k in res.connected)
+        assert res.demand_flow == pytest.approx(powers * FULL_LOAD_HOURS / HOURS_PER_YEAR)
+        assert res.producer_flow == pytest.approx(res.demand_flow + res.loss_flow)
+
+    def test_not_worse_than_forced(self, seed):
+        """Forced connection is one feasible economic solution."""
+        G, b, s = random_case(seed)
+        _, _, forced = _solve(G, b, s)
+        _, _, economic = _economic(G, b, s)
+        forced_with_revenue = forced.objective - PRICE * HOURS_PER_YEAR * forced.demand_flow
+        assert economic.objective <= forced_with_revenue + economic.mip_abs_gap + 1e-6

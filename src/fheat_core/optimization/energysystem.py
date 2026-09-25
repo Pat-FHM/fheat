@@ -25,9 +25,9 @@ import pandas as pd
 
 from fheat_core import columns as cols
 from fheat_core.config import OptimizationConfig
-from fheat_core.optimization import HOURS_PER_YEAR, MISSING_OPT_EXTRA
+from fheat_core.optimization import HOURS_PER_YEAR, MISSING_OPT_EXTRA, MODE_ECONOMIC
 from fheat_core.optimization.block import build_network_block
-from fheat_core.optimization.glf_terms import ReferenceTree, glf_factors, reference_tree
+from fheat_core.optimization.glf_terms import ReferenceTree, glf_estimated, glf_factors, reference_tree
 from fheat_core.optimization.linearize import PipeLinearization
 from fheat_core.optimization.preprocess import SimplifiedNetwork, edge_key
 
@@ -47,16 +47,17 @@ MIP_ABS_GAP_AUTO_SHARE = 0.005   # "auto": 0.5 % of the pipe annuity of the refe
 
 @dataclass(frozen=True)
 class ObjectiveParts:
-    """Objective terms [€/a]."""
+    """Objective terms [€/a]; the revenue is subtracted."""
 
     source_invest: float      # annuity of the producer capacity
-    heat_demand: float        # heat cost of the consumers' demand
+    heat_demand: float        # heat cost of the supplied demand
     heat_losses: float        # heat cost of the network losses
     pipes: float              # annuity of the linearised pipe investment
+    revenue: float            # heat price · supplied demand (economic mode, else 0)
 
     @property
     def total(self) -> float:
-        return self.source_invest + self.heat_demand + self.heat_losses + self.pipes
+        return self.source_invest + self.heat_demand + self.heat_losses + self.pipes - self.revenue
 
 
 @dataclass
@@ -67,11 +68,13 @@ class MilpResult:
     ``cols.TYPE``, ``cols.LENGTH`` [m], ``fixed`` (bridge built without a
     binary), ``built``, ``flow_from``, ``flow_to``, ``cols.CAPACITY_MODEL``
     (C [kW]), ``cols.THERMAL_POWER`` (S [kW]), ``cols.N_BUILDINGS`` (n),
-    ``cols.GLF_MODEL`` (g_e of block.py, (7)), ``heat_loss`` [kW] and
-    ``cols.INVEST_COST_MODEL`` [€] of the linearised model.
+    ``cols.GLF_MODEL`` (g_e of block.py, (7)), ``cols.GLF_MODEL_ESTIMATED``,
+    ``heat_loss`` [kW] and ``cols.INVEST_COST_MODEL`` [€] of the linearised
+    model. ``connected`` lists the building keys with x_k = 1.
     """
 
     termination: str
+    mode: str
     glf_mode: str
     objective: float            # [€/a]
     best_bound: float | None    # lower bound of the objective [€/a]
@@ -82,6 +85,7 @@ class MilpResult:
     demand_flow: float          # [kW]
     loss_flow: float            # [kW]
     edges: pd.DataFrame
+    connected: list
     build_time_s: float
     solve_time_s: float
 
@@ -108,13 +112,13 @@ def solve_network(
     """Build the energy system with the network block and solve it once.
 
     ``heat_demand`` maps every building key of ``network`` to W_k [kWh/a].
+    ``config.mode`` decides whether every building is connected.
     ``linearization`` is built from ``glf_terms.design_loads`` (the same cost
     line for both glf modes).
     """
     t0 = time.perf_counter()
     tree = reference_tree(network)
     glf = glf_factors(network, tree, config.glf_mode)
-    demand_flow = sum(heat_demand[k] for k in network.building_nodes) / HOURS_PER_YEAR
     comp = _components(config)
     es = solph.EnergySystem(
         timeindex=pd.date_range("2025-01-01", periods=2, freq=f"{HOURS_PER_YEAR}h"),
@@ -122,8 +126,8 @@ def solve_network(
     )
     es.add(comp.bus, comp.producer, comp.consumers, comp.losses)
     model = solph.Model(es)
-    model.netz = build_network_block(network, linearization, glf)
-    _couple(model, comp, demand_flow)
+    model.netz = build_network_block(network, linearization, glf, heat_demand, config.mode)
+    _couple(model, comp)
     _add_pipe_annuity(model, pipe_annuity(config))
     abs_gap = _mip_abs_gap(network, linearization, tree, glf, config)
     build_time = time.perf_counter() - t0
@@ -132,6 +136,11 @@ def solve_network(
     results = _run_highs(model, abs_gap, config.time_limit_s)
     solve_time = time.perf_counter() - t0
     return _result(model, comp, network, glf, results, config, abs_gap, (build_time, solve_time))
+
+
+def _heat_price(config) -> float:
+    """Revenue [€/kWh] of the supplied heat: the heat price in the economic mode, else 0."""
+    return config.heat_price_eur_per_kwh if config.mode == MODE_ECONOMIC else 0.0
 
 
 def pipe_annuity(config) -> float:
@@ -151,17 +160,19 @@ def _components(config) -> _Components:
             variable_costs=config.heat_cost_eur_per_kwh,
         )},
     )
-    consumers = solph.components.Sink(label="verbraucher", inputs={bus: solph.Flow()})
+    consumers = solph.components.Sink(
+        label="verbraucher", inputs={bus: solph.Flow(variable_costs=-_heat_price(config))}
+    )
     losses = solph.components.Sink(label="netzverluste", inputs={bus: solph.Flow()})
     return _Components(bus, producer, consumers, losses)
 
 
-def _couple(model, comp, demand_flow):
+def _couple(model, comp):
     """block.py, (9) and (10)."""
     netz = model.netz
     invest = model.InvestmentFlowBlock.invest[comp.producer, comp.bus, 0]
     model.demand_coupling = po.Constraint(
-        model.TIMESTEPS, rule=lambda m, t: m.flow[comp.bus, comp.consumers, t] == demand_flow
+        model.TIMESTEPS, rule=lambda m, t: m.flow[comp.bus, comp.consumers, t] == netz.supplied_demand
     )
     model.loss_coupling = po.Constraint(
         model.TIMESTEPS, rule=lambda m, t: m.flow[comp.bus, comp.losses, t] == netz.heat_loss
@@ -223,9 +234,11 @@ def _result(model, comp, network, glf, results, config, abs_gap, run_times) -> M
         heat_demand=heat_cost * demand_flow,
         heat_losses=heat_cost * loss_flow,
         pipes=pipe_annuity(config) * po.value(netz.invest_cost),
+        revenue=_heat_price(config) * HOURS_PER_YEAR * demand_flow,
     )
     return MilpResult(
         termination=str(results.termination_condition.name),
+        mode=config.mode,
         glf_mode=config.glf_mode,
         objective=po.value(model.objective),
         best_bound=results.best_objective_bound,
@@ -235,13 +248,14 @@ def _result(model, comp, network, glf, results, config, abs_gap, run_times) -> M
         producer_flow=po.value(model.flow[comp.producer, comp.bus, 0]),
         demand_flow=demand_flow,
         loss_flow=loss_flow,
-        edges=_edge_table(netz, network, glf),
+        edges=_edge_table(netz, network, glf, glf_estimated(network, config.glf_mode, config.mode)),
+        connected=[k for k, n in network.building_nodes.items() if po.value(netz.connected[n]) > 0.5],
         build_time_s=run_times[0],
         solve_time_s=run_times[1],
     )
 
 
-def _edge_table(netz, network, glf) -> pd.DataFrame:
+def _edge_table(netz, network, glf, estimated) -> pd.DataFrame:
     built_arc = {edge_key(*a): a for a in netz.ARCS if po.value(netz.direction[a]) > 0.5}
     rows = []
     for u, v, data in network.graph.edges(data=True):
@@ -258,6 +272,7 @@ def _edge_table(netz, network, glf) -> pd.DataFrame:
             cols.THERMAL_POWER: po.value(netz.power_flow[arc]) if arc else 0.0,
             cols.N_BUILDINGS: po.value(netz.count_flow[arc]) if arc else 0.0,
             cols.GLF_MODEL: glf[e],
+            cols.GLF_MODEL_ESTIMATED: estimated[e],
             "heat_loss": po.value(netz.section_loss[e]),
             cols.INVEST_COST_MODEL: po.value(netz.section_invest[e]),
         })

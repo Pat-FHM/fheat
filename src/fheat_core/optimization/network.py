@@ -12,6 +12,7 @@ backend. Steps:
 """
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import NamedTuple
 
@@ -19,7 +20,7 @@ import geopandas as gpd
 import pandas as pd
 
 from fheat_core import columns as cols
-from fheat_core.optimization import STATUS_CONNECTED, STATUS_UNREACHABLE
+from fheat_core.optimization import MODE_ECONOMIC, STATUS_CONNECTED, STATUS_NOT_ECONOMIC, STATUS_UNREACHABLE
 from fheat_core.optimization.energysystem import MilpResult, pipe_annuity, solve_network
 from fheat_core.optimization.glf_terms import design_loads
 from fheat_core.optimization.linearize import linearize_pipes
@@ -27,13 +28,16 @@ from fheat_core.optimization.postprocess import PostCalculation, postprocess
 from fheat_core.optimization.preprocess import SimplificationReport, building_ids, simplify_network
 from fheat_core.resources import load_pipe_costs, load_pipe_info
 
+logger = logging.getLogger(__name__)
+
 @dataclass(frozen=True)
 class OptimizationReport:
     """Everything the MILP run reports besides ``net_gdf``.
 
     ``fit_quality`` is ``PipeLinearization.report()`` (one row per cost/loss
     line and DN), ``unreachable`` the ``building_id``s (or index) of buildings
-    without a route to the source.
+    without a route to the source, ``not_connected_economic`` those of
+    reachable buildings the economic mode leaves unconnected.
     """
 
     milp: MilpResult
@@ -42,30 +46,36 @@ class OptimizationReport:
     fit_quality: pd.DataFrame
     fit_warnings: tuple[str, ...]
     unreachable: list
+    not_connected_economic: list
 
     def summary(self) -> dict:
         """Key figures for the result summary (``milp_*`` keys)."""
         m, p = self.milp, self.post
         cost_lines = self.fit_quality[self.fit_quality["quantity"] == "cost"]
         return {
+            "milp_mode": m.mode,
             "milp_glf_mode": m.glf_mode,
             "milp_termination": m.termination,
             "milp_objective_eur_a": round(m.objective, 1),
-            "milp_gap_eur_a": None if m.achieved_gap is None else round(m.achieved_gap, 1),
+            "milp_gap_eur_a": _round(m.achieved_gap, 1),
             "milp_solve_time_s": round(m.solve_time_s, 2),
+            "milp_connected_buildings": len(m.connected),
             "milp_unreachable_buildings": len(self.unreachable),
+            "milp_not_connected_economic": len(self.not_connected_economic),
             "milp_producer_capacity_kw": round(p.producer_capacity, 1),
             "milp_producer_capacity_model_kw": round(m.source_capacity, 1),
             "milp_pipe_invest_eur": round(p.invest_cost, 0),
             "milp_pipe_invest_model_eur": round(p.invest_cost_model, 0),
-            "milp_cost_line_deviation": round(p.cost_line_deviation, 4),
+            "milp_cost_line_deviation": _round(p.cost_line_deviation, 4),
             "milp_pipe_annuity_eur_a": round(p.annual_cost, 1),
             "milp_cost_source_eur_a": round(m.objective_parts.source_invest, 1),
             "milp_cost_heat_eur_a": round(m.objective_parts.heat_demand, 1),
             "milp_cost_losses_eur_a": round(m.objective_parts.heat_losses, 1),
             "milp_cost_pipes_eur_a": round(m.objective_parts.pipes, 1),
-            "milp_glf_max_deviation": round(p.glf_max_deviation, 4),
-            "milp_capacity_max_deviation": round(p.capacity_max_deviation, 4),
+            "milp_revenue_eur_a": round(m.objective_parts.revenue, 1),
+            "milp_glf_max_deviation": _round(p.glf_max_deviation, 4),
+            "milp_glf_estimated_sections": p.glf_estimated_sections,
+            "milp_capacity_max_deviation": _round(p.capacity_max_deviation, 4),
             "milp_sections_above_largest_dn": p.sections_above_largest_dn,
             "milp_cost_line_max_deviation_per_dn": round(float(cost_lines["deviation"].abs().max()), 4),
             "milp_fit_warnings": len(self.fit_warnings),
@@ -108,6 +118,12 @@ def build_network(
     )
     milp = solve_network(network, lin, candidates[cols.HEAT_DEMAND].to_dict(), opt)
     net_gdf, post = postprocess(network, milp.edges, lin, pipe_info, pipe_costs, pipe_annuity(opt), candidates.crs)
+    not_economic = [k for k in network.building_nodes if k not in set(milp.connected)]
+    if opt.mode == MODE_ECONOMIC and not milp.connected:
+        logger.warning(
+            "At a heat price of %s €/kWh no building pays for its connection; the network is empty.",
+            opt.heat_price_eur_per_kwh,
+        )
     report = OptimizationReport(
         milp=milp,
         post=post,
@@ -115,20 +131,25 @@ def build_network(
         fit_quality=lin.report(),
         fit_warnings=lin.warnings,
         unreachable=building_ids(candidates, network.unreachable_buildings),
+        not_connected_economic=building_ids(candidates, not_economic),
     )
-    return NetworkResult(
-        net_gdf, _connection_status(buildings.loc[candidates.index], network.unreachable_buildings), report
-    )
+    statuses = _connection_status(buildings.loc[candidates.index], network.unreachable_buildings, not_economic)
+    return NetworkResult(net_gdf, statuses, report)
+
+
+def _round(value, digits):
+    return None if value is None else round(value, digits)
 
 
 def _or_default(provided, load):
     return load() if provided is None else provided
 
 
-def _connection_status(candidates, unreachable) -> gpd.GeoDataFrame:
+def _connection_status(candidates, unreachable, not_economic) -> gpd.GeoDataFrame:
     """Candidate buildings with ``cols.CONNECT`` and ``cols.CONNECTION_STATUS`` updated."""
     out = candidates.copy()
     out[cols.CONNECTION_STATUS] = STATUS_CONNECTED
-    out.loc[unreachable, cols.CONNECT] = 0
-    out.loc[unreachable, cols.CONNECTION_STATUS] = STATUS_UNREACHABLE
+    for keys, status in ((unreachable, STATUS_UNREACHABLE), (not_economic, STATUS_NOT_ECONOMIC)):
+        out.loc[keys, cols.CONNECT] = 0
+        out.loc[keys, cols.CONNECTION_STATUS] = status
     return out

@@ -145,7 +145,15 @@ What the step does:
 5. re-calculates the chosen network with the exact GLF, the real DN
    (`calculate_diameter_velocity_loss`) and the real pipe costs.
 
-Every reachable building with `connect == 1` is connected (forced mode).
+Two modes decide which buildings with `connect == 1` are connected:
+
+- `mode="erzwungen"` (default): every reachable building;
+- `mode="wirtschaftlich"`: a building is connected only if the revenue
+  `heat_price_eur_per_kwh` · annual demand pays for its share of pipes,
+  producer and heat cost. The heat price has no default and must be given.
+  Unconnected buildings get `connect = 0` and
+  `connection_status = "wirtschaftlich nicht angeschlossen"`.
+
 Buildings without a route to the source get `connect = 0` and
 `connection_status = "nicht erreichbar"` (`on_unreachable="error"` stops
 instead). The formulation (sets, variables, numbered constraints, objective) is
@@ -158,6 +166,7 @@ put model and post-calculated values side by side:
 |---|---|---|
 | `glf` | `GLF` | exact GLF of the section |
 | `glf_model` | `GLF_Modell` | GLF used in the MILP |
+| `glf_model_estimated` | `GLF_Modell_geschaetzt` | `True` if `glf_model` is an estimate (outside bridges; on bridges in the economic mode) |
 | `capacity_model` | `Kapazitaet_Modell [kW]` | design capacity in the MILP (compare with `thermal_power_glf`) |
 | `invest_cost_model` | `Investition_Modell [EUR]` | linearised pipe investment |
 | `invest_cost` | `Investition [EUR]` | pipe investment of the chosen DN |
@@ -166,13 +175,15 @@ put model and post-calculated values side by side:
 The buildings get `connection_status` (`Anschlussstatus`). The result summary
 adds `milp_*` key figures (objective, gap, solve time, producer capacity
 GLF(N) · ΣQ + losses, real and linearised pipe investment and their deviation,
-unreachable buildings). `state.optimization_report` holds the full report,
+connected, unreachable and economically unconnected buildings, revenue). `state.optimization_report` holds the full report,
 including the quality of every cost and loss line per DN.
 
 **Parameters** (`OptimizationConfig`):
 
 | Field | Default | Note |
 |---|---|---|
+| `mode` | `"erzwungen"` | `"wirtschaftlich"`: connect a building only if it pays |
+| `heat_price_eur_per_kwh` | none | [€/kWh] revenue; required in the economic mode, not allowed otherwise |
 | `glf_mode` | `"referenz"` | `"aus"`: no simultaneity, for comparison |
 | `interest_rate`, `lifetime_pipes` | 0.08, 20 a | placeholder, Lambert et al. 2025 |
 | `source_capex_eur_per_kw`, `lifetime_source` | 598 €/kW, 20 a | placeholder, Lambert et al. 2025, Tab. 7 (central air-water heat pump) |
@@ -187,9 +198,11 @@ Tab. 8) and the economic defaults are **placeholders** (`PLATZHALTER`) and must
 be replaced by project-specific values; an adapter can supply its own costs
 via `provide_pipe_costs()`.
 
-**Limits.** One heat source. One time step (annual energy, design case). The
-GLF of sections that are not bridges is estimated from the shortest-path tree;
-the post-calculation reports the exact value.
+**Limits.** One heat source and one heat price for all buildings. One time
+step (annual energy, design case). The GLF of sections that are not bridges is
+estimated from the shortest-path tree, in the economic mode also on bridges
+(the buildings behind are only an upper bound); the post-calculation reports
+the exact value.
 
 ## Tests
 
