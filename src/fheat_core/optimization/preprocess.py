@@ -53,6 +53,7 @@ KIND_BUILDING = "building"
 KIND_SOURCE = "source"
 KIND_JUNCTION = "junction"
 BUILDING_KEY = "building_key"   # index of the building in buildings_gdf
+POWER = "power"                 # connection power of a building [kW]
 SOURCE_KEY = "source_key"       # index of the source in source_gdf
 
 # edge attributes (besides cols.TYPE and cols.LENGTH)
@@ -101,7 +102,7 @@ class SimplifiedNetwork:
     """Candidate graph for the MILP.
 
     ``graph`` has integer nodes with the attributes ``coord``, ``kind`` and
-    ``building_key`` / ``source_key``; edges carry ``cols.TYPE``,
+    ``building_key`` and ``power`` [kW] / ``source_key``; edges carry ``cols.TYPE``,
     ``cols.LENGTH`` [m], ``geometry`` and the bridge attributes.
     ``node_ids`` maps every coordinate of the input graph to its integer ID,
     ``node_coords`` the other way round.
@@ -117,6 +118,20 @@ class SimplifiedNetwork:
 
     def bridges(self) -> list[tuple[int, int]]:
         return [(u, v) for u, v, d in self.graph.edges(data=True) if d[IS_BRIDGE]]
+
+    def source_node(self) -> int:
+        """The node of the only heat source; the MILP supports exactly one."""
+        if len(self.source_nodes) != 1:
+            raise ValueError(
+                f"The MILP network optimisation needs exactly one heat source "
+                f"(found {len(self.source_nodes)})."
+            )
+        return next(iter(self.source_nodes.values()))
+
+
+def edge_key(u: int, v: int) -> tuple[int, int]:
+    """Orientation-free key of the section between ``u`` and ``v``."""
+    return (u, v) if u < v else (v, u)
 
 
 def simplify_network(
@@ -147,7 +162,7 @@ def simplify_network(
         length_before=_total_length(G),
     )
     H, node_coords, node_ids = _integer_graph(G)
-    building_nodes, power, unreachable = _mark_buildings(H, node_ids, buildings_gdf, power_att)
+    building_nodes, unreachable = _mark_buildings(H, node_ids, buildings_gdf, power_att)
     source_nodes = _mark_sources(H, node_ids, source_gdf)
 
     _remove_disconnected(H, source_nodes.values(), report)
@@ -156,7 +171,7 @@ def simplify_network(
     _check_leaves(H, building_nodes, source_nodes)
 
     H = _reduce_until_stable(H, source_nodes.values(), report)
-    _mark_bridges(H, source_nodes, {building_nodes[k]: power[k] for k in building_nodes}, report)
+    _mark_bridges(H, source_nodes, {n: H.nodes[n][POWER] for n in building_nodes.values()}, report)
 
     report.nodes_after = H.number_of_nodes()
     report.edges_after = H.number_of_edges()
@@ -205,9 +220,8 @@ def _reduce_until_stable(H, sources, report) -> nx.Graph:
 
 
 def _mark_buildings(H, node_ids, buildings_gdf, power_att):
-    """Mark building nodes; buildings missing in the graph are unreachable."""
+    """Mark building nodes with key and power; buildings missing in the graph are unreachable."""
     building_nodes: dict[Hashable, int] = {}
-    power: dict[Hashable, float] = {}
     unreachable: list = []
     seen: dict[int, Hashable] = {}
     for key, row in buildings_gdf.iterrows():
@@ -224,9 +238,9 @@ def _mark_buildings(H, node_ids, buildings_gdf, power_att):
         seen[node] = key
         H.nodes[node][KIND] = KIND_BUILDING
         H.nodes[node][BUILDING_KEY] = key
+        H.nodes[node][POWER] = float(row[power_att])
         building_nodes[key] = node
-        power[key] = float(row[power_att])
-    return building_nodes, power, unreachable
+    return building_nodes, unreachable
 
 
 def _mark_sources(H, node_ids, source_gdf):

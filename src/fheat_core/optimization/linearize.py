@@ -80,9 +80,31 @@ class PipeLinearization:
     warnings: tuple[str, ...] = field(default_factory=tuple)
 
     def fit(self, quantity: str, edge_type: str) -> LinearFit:
-        """Return the fit for ``quantity`` in {"cost", "loss"} and an edge type."""
+        """Return the fit for ``quantity`` in {"cost", "loss"} and an edge type.
+
+        Every edge type other than a house connection uses the street pipe fit
+        (same rule as ``calculate_diameter_velocity_loss``).
+        """
         prefix = "house" if edge_type == HOUSE_CONNECTION else "street"
         return getattr(self, f"{prefix}_{quantity}")
+
+    def invest_cost(self, edge_type: str, length, capacity, built):
+        """Pipe investment [€] of a section: L · (a_K · C + b_K · y) (plan section 6, objective).
+
+        ``length`` [m], ``capacity`` C [kW], ``built`` y (0/1). Accepts numbers
+        and Pyomo expressions.
+        """
+        f = self.fit("cost", edge_type)
+        return length * (f.slope * capacity + f.intercept * built)
+
+    def heat_loss(self, edge_type: str, length, capacity, built):
+        """Heat loss [kW] of a section: (a_V · C + b_V · y) · L / 1000 (plan section 6, no. 8).
+
+        ``length`` [m], ``capacity`` C [kW], ``built`` y (0/1). Accepts numbers
+        and Pyomo expressions.
+        """
+        f = self.fit("loss", edge_type)
+        return (f.slope * capacity + f.intercept * built) * length / 1000
 
     def report(self) -> pd.DataFrame:
         """Fit quality as one long table (one row per fit and DN)."""

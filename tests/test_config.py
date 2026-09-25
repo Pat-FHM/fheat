@@ -73,3 +73,36 @@ class TestCustomConfig:
         assert cfg.supply_temperature == 95.0
         assert cfg.year == 2030
         assert cfg.output_dir == str(tmp_path)
+
+
+class TestOptimizationConfig:
+    def test_defaults(self):
+        from fheat_core.config import OptimizationConfig
+
+        cfg = OptimizationConfig()
+        assert (cfg.interest_rate, cfg.lifetime_pipes) == (0.08, 20)
+        assert (cfg.source_capex_eur_per_kw, cfg.lifetime_source) == (598.0, 20)
+        assert cfg.heat_cost_eur_per_kwh == 0.08
+        assert (cfg.mip_rel_gap, cfg.mip_abs_gap, cfg.time_limit_s) == (0.01, "auto", 300.0)
+
+    @pytest.mark.parametrize("kwargs, match", [
+        ({"interest_rate": 0.0}, "interest_rate"),
+        ({"lifetime_pipes": 0}, "lifetime_pipes"),
+        ({"lifetime_source": -1}, "lifetime_source"),
+        ({"time_limit_s": 0}, "time_limit_s"),
+        ({"source_capex_eur_per_kw": -1.0}, "source_capex_eur_per_kw"),
+        ({"heat_cost_eur_per_kwh": -0.1}, "heat_cost_eur_per_kwh"),
+        ({"mip_rel_gap": -0.01}, "mip_rel_gap"),
+        ({"mip_abs_gap": "fast"}, "mip_abs_gap"),
+        ({"mip_abs_gap": -5.0}, "mip_abs_gap"),
+    ])
+    def test_invalid_values_raise(self, kwargs, match):
+        from fheat_core.config import OptimizationConfig
+
+        with pytest.raises(ValueError, match=match):
+            OptimizationConfig(**kwargs)
+
+    def test_numeric_abs_gap(self):
+        from fheat_core.config import OptimizationConfig
+
+        assert OptimizationConfig(mip_abs_gap=250.0).mip_abs_gap == 250.0

@@ -277,3 +277,29 @@ class TestReport:
     def test_capacities_cover_catalogue(self, pipe_info, reference):
         assert list(reference.capacities["DN"]) == list(pipe_info["DN"])
         assert reference.capacities["capacity"].is_monotonic_increasing
+
+
+class TestModelTerms:
+    """invest_cost and heat_loss are the linearised terms used in the MILP."""
+
+    def test_invest_cost(self, reference):
+        f = reference.street_cost
+        assert reference.invest_cost(STREET_PIPE, 10.0, 100.0, 1) == pytest.approx(
+            10.0 * (f.slope * 100.0 + f.intercept)
+        )
+
+    def test_not_built_costs_nothing(self, reference):
+        assert reference.invest_cost(HOUSE_CONNECTION, 25.0, 0.0, 0) == 0.0
+        assert reference.heat_loss(HOUSE_CONNECTION, 25.0, 0.0, 0) == 0.0
+
+    def test_heat_loss_in_kw(self, reference):
+        f = reference.house_loss
+        assert reference.heat_loss(HOUSE_CONNECTION, 20.0, 30.0, 1) == pytest.approx(
+            (f.slope * 30.0 + f.intercept) * 20.0 / 1000
+        )
+
+    def test_source_connection_uses_street_fits(self, reference):
+        from fheat_core.optimization import SOURCE_CONNECTION
+
+        assert reference.fit("cost", SOURCE_CONNECTION) is reference.street_cost
+        assert reference.fit("loss", SOURCE_CONNECTION) is reference.street_loss

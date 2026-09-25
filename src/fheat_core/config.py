@@ -50,3 +50,40 @@ class FHeatConfig:
                 f"output_language '{self.output_language}' is not allowed. "
                 f"Allowed values: {sorted(self._ALLOWED_LANGUAGES)}"
             )
+
+
+@dataclass
+class OptimizationConfig:
+    """Parameters of the MILP network optimisation (plan section 9).
+
+    The economic defaults are PLATZHALTER values from the literature and must
+    be replaced by project-specific values.
+    """
+
+    # Economics — PLATZHALTER, see sources
+    interest_rate: float = 0.08              # Lambert et al. 2025 (internal rate of return)
+    lifetime_pipes: int = 20                 # [a] Lambert et al. 2025
+    source_capex_eur_per_kw: float = 598.0   # [€/kW] Lambert et al. 2025, Tab. 7 (central air-water HP)
+    lifetime_source: int = 20                # [a] Lambert et al. 2025, Tab. 7
+    heat_cost_eur_per_kwh: float = 0.08      # [€/kWh] Lambert et al. 2024, Tab. 1
+
+    # Solver (HiGHS)
+    mip_rel_gap: float = 0.01
+    mip_abs_gap: float | str = "auto"        # [€/a]; "auto": 0.5 % of the pipe annuity of the shortest-path tree
+    time_limit_s: float = 300.0
+
+    def __post_init__(self) -> None:
+        if self.interest_rate <= 0:
+            raise ValueError(f"interest_rate ({self.interest_rate}) must be greater than 0.")
+        for name in ("lifetime_pipes", "lifetime_source", "time_limit_s"):
+            if getattr(self, name) <= 0:
+                raise ValueError(f"{name} ({getattr(self, name)}) must be greater than 0.")
+        for name in ("source_capex_eur_per_kw", "heat_cost_eur_per_kwh", "mip_rel_gap"):
+            if getattr(self, name) < 0:
+                raise ValueError(f"{name} ({getattr(self, name)}) must not be negative.")
+        if self.mip_abs_gap != "auto" and (
+            isinstance(self.mip_abs_gap, str) or self.mip_abs_gap < 0
+        ):
+            raise ValueError(
+                f"mip_abs_gap ({self.mip_abs_gap!r}) must be 'auto' or a non-negative number [€/a]."
+            )

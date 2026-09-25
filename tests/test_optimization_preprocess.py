@@ -17,25 +17,13 @@ The graphs are built with the same functions as ``steps/network.py``.
 from __future__ import annotations
 
 import math
-import random
 
 import geopandas as gpd
 import networkx as nx
 import pytest
-from shapely.geometry import LineString, Point, Polygon
+from shapely.geometry import Point
 
 from fheat_core import columns as cols
-from fheat_core.algorithms.geometry import (
-    add_centroids,
-    closest_points_to_streets,
-    insert_connection_points,
-)
-from fheat_core.algorithms.network import (
-    add_edge_lengths,
-    build_street_graph,
-    connect_buildings_to_graph,
-    connect_source_to_graph,
-)
 from fheat_core.optimization import HOUSE_CONNECTION, SOURCE_CONNECTION, STREET_PIPE
 from fheat_core.optimization.preprocess import (
     BUILDING_KEY,
@@ -49,47 +37,18 @@ from fheat_core.optimization.preprocess import (
     KIND_JUNCTION,
     KIND_SOURCE,
     N_BEHIND,
+    POWER,
     POWER_BEHIND,
+    edge_key,
     simplify_network,
 )
 
-CRS = "EPSG:25832"
+from tests.optimization_graphs import CRS, pipeline_graph, random_case, street_graph
 
 
 # ---------------------------------------------------------------------------
 # helpers
 # ---------------------------------------------------------------------------
-
-
-def _graph(streets, buildings, sources):
-    """Build the F|Heat street graph from explicit connection points.
-
-    streets:   list of coordinate lists (connection points must be vertices)
-    buildings: list of (centroid, connection_point, power)
-    sources:   list of (point, connection_point)
-    """
-    streets_gdf = gpd.GeoDataFrame({"geometry": [LineString(s) for s in streets]}, crs=CRS)
-    b = gpd.GeoDataFrame(
-        {
-            cols.CENTROID: [Point(c) for c, _, _ in buildings],
-            cols.CONNECTION_POINT: [Point(cp) if cp is not None else None for _, cp, _ in buildings],
-            cols.THERMAL_POWER: [p for _, _, p in buildings],
-            "geometry": [Point(c) for c, _, _ in buildings],
-        },
-        crs=CRS,
-    )
-    s = gpd.GeoDataFrame(
-        {
-            cols.CONNECTION_POINT: [Point(cp) for _, cp in sources],
-            "geometry": [Point(p) for p, _ in sources],
-        },
-        crs=CRS,
-    )
-    G = build_street_graph(streets_gdf, CRS)
-    G = connect_buildings_to_graph(G, b)
-    G = connect_source_to_graph(G, s)
-    G = add_edge_lengths(G)
-    return G, b, s
 
 
 def _length(G):
@@ -168,7 +127,7 @@ def line_case():
     ]
     buildings = [((10, 10), (10, 0), 10.0), ((30, 10), (30, 0), 20.0)]
     sources = [((-10, 0), (0, 0))]
-    return _graph(streets, buildings, sources)
+    return street_graph(streets, buildings, sources)
 
 
 @pytest.fixture
@@ -187,7 +146,7 @@ def ring_case():
         ((10, 100), (0, 100), 30.0),
     ]
     sources = [((-10, 0), (0, 0))]
-    return _graph(streets, buildings, sources)
+    return street_graph(streets, buildings, sources)
 
 
 @pytest.fixture
@@ -199,7 +158,7 @@ def parallel_case():
     ]
     buildings = [((110, 0), (100, 0), 50.0)]
     sources = [((-10, 0), (0, 0))]
-    return _graph(streets, buildings, sources)
+    return street_graph(streets, buildings, sources)
 
 
 # ---------------------------------------------------------------------------
@@ -267,7 +226,7 @@ class TestDeadEnds:
         Removing B together with its dead end raised the path 30 m → 110 m.
         """
         dx = math.sqrt(25 ** 2 - 5 ** 2)  # detour vertex: two 25 m segments
-        G, b, s = _graph(
+        G, b, s = street_graph(
             streets=[
                 [(0, 0), (10, 0)],
                 [(10, 0), (10, 10)],
@@ -426,7 +385,7 @@ class TestBridges:
 
     def test_two_sources(self):
         """A bridge with a source on both sides has no fixed direction."""
-        G, b, s = _graph(
+        G, b, s = street_graph(
             streets=[[(0, 0), (50, 0), (100, 0)]],
             buildings=[((50, 10), (50, 0), 10.0)],
             sources=[((-10, 0), (0, 0)), ((110, 0), (100, 0))],
@@ -457,7 +416,7 @@ class TestUnreachable:
         assert 99 not in net.building_nodes
 
     def test_disconnected_part_removed(self, caplog):
-        G, b, s = _graph(
+        G, b, s = street_graph(
             streets=[[(0, 0), (50, 0)], [(200, 0), (250, 0)]],
             buildings=[((50, 10), (50, 0), 10.0), ((250, 10), (250, 0), 10.0)],
             sources=[((-10, 0), (0, 0))],
@@ -472,7 +431,7 @@ class TestUnreachable:
         _assert_report_balance(G, net)
 
     def test_warning_names_building_ids(self, caplog):
-        G, b, s = _graph(
+        G, b, s = street_graph(
             streets=[[(0, 0), (50, 0)], [(200, 0), (250, 0)]],
             buildings=[((50, 10), (50, 0), 10.0), ((250, 10), (250, 0), 10.0)],
             sources=[((-10, 0), (0, 0))],
@@ -484,7 +443,7 @@ class TestUnreachable:
         assert "B-42" in msg and "B-17" not in msg
 
     def test_error_mode_raises(self):
-        G, b, s = _graph(
+        G, b, s = street_graph(
             streets=[[(0, 0), (50, 0)], [(200, 0), (250, 0)]],
             buildings=[((50, 10), (50, 0), 10.0), ((250, 10), (250, 0), 10.0)],
             sources=[((-10, 0), (0, 0))],
@@ -515,7 +474,7 @@ class TestEdgeTypes:
 class TestSelfLoops:
     def test_repeated_street_vertex(self):
         """A repeated vertex creates a 0 m self-loop in the street graph."""
-        G, b, s = _graph(
+        G, b, s = street_graph(
             streets=[[(0, 0), (10, 0), (10, 0), (20, 0)]],
             buildings=[((20, 10), (20, 0), 10.0)],
             sources=[((-10, 0), (0, 0))],
@@ -552,7 +511,7 @@ class TestInputErrors:
 
     def test_building_on_street_vertex_raises(self):
         """A centroid on a street vertex is not a leaf of the graph."""
-        G, b, s = _graph(
+        G, b, s = street_graph(
             streets=[[(0, 0), (10, 0), (20, 0)]],
             buildings=[((10, 0), (10, 0), 10.0)],
             sources=[((-10, 0), (0, 0))],
@@ -576,26 +535,8 @@ class TestPipelineGraph:
         for k in range(3):
             lines.append([(x, 100.0 * k) for x in range(0, 201, 10)])
             lines.append([(100.0 * k, y) for y in range(0, 201, 10)])
-        streets = gpd.GeoDataFrame({cols.ROUTABLE: [1] * len(lines),
-                                    "geometry": [LineString(l) for l in lines]}, crs=CRS)
-        polys, power = [], []
-        for i, (x, y) in enumerate([(33, 12), (67, 112), (145, 188), (188, 55), (12, 160), (120, 88)]):
-            polys.append(Polygon([(x - 4, y - 4), (x + 4, y - 4), (x + 4, y + 4), (x - 4, y + 4)]))
-            power.append(10.0 + i)
-        buildings = gpd.GeoDataFrame({cols.THERMAL_POWER: power, "geometry": polys}, crs=CRS)
-        source = gpd.GeoDataFrame({"geometry": [Point(-15, -15)]}, crs=CRS)
-
-        buildings = add_centroids(buildings)
-        buildings = closest_points_to_streets(buildings, streets, centroid_col=cols.CENTROID)
-        source[cols.CENTROID] = source.geometry
-        source = closest_points_to_streets(source, streets, centroid_col=cols.CENTROID)
-        streets = insert_connection_points(streets, buildings)
-        streets = insert_connection_points(streets, source)
-        G = build_street_graph(streets, CRS)
-        G = connect_buildings_to_graph(G, buildings)
-        G = connect_source_to_graph(G, source)
-        G = add_edge_lengths(G)
-        return G, buildings, source
+        centroids = [(33, 12), (67, 112), (145, 188), (188, 55), (12, 160), (120, 88)]
+        return pipeline_graph(lines, centroids, [10.0 + i for i in range(6)], (-15, -15))
 
     def test_reduces_graph(self, pipeline_case):
         G, b, s = pipeline_case
@@ -633,73 +574,6 @@ class TestPipelineGraph:
 # ---------------------------------------------------------------------------
 
 
-def _random_case(seed):
-    """Irregular mesh with dead ends (chains, branches, loops) at mesh nodes.
-
-    Buildings sit on mesh nodes and dead-end nodes; some dead ends and some
-    mesh parts stay without buildings, some buildings end up unreachable.
-    """
-    rng = random.Random(seed)
-    m, streets = _random_mesh(rng)
-    mesh = sorted({p for line in streets for p in line})
-    if not mesh:
-        return _random_case(seed + 1000)
-    dead_end_nodes = []
-    for _ in range(rng.randint(1, 3 * m)):
-        lines, nodes = _random_dead_end(rng, rng.choice(mesh))
-        streets += lines
-        dead_end_nodes += nodes
-    buildings, sources = _random_terminals(rng, mesh, mesh + dead_end_nodes)
-    return _graph(streets, buildings, sources)
-
-
-def _random_mesh(rng):
-    """m × m grid (50 m, jittered nodes), each grid street kept with 75 %."""
-    m = rng.randint(3, 6)
-    pos = {
-        (i, j): (i * 50 + rng.uniform(-10, 10), j * 50 + rng.uniform(-10, 10))
-        for i in range(m) for j in range(m)
-    }
-    streets = []
-    for (i, j), p in pos.items():
-        for di, dj in ((1, 0), (0, 1)):
-            if (i + di, j + dj) in pos and rng.random() < 0.75:
-                streets.append([p, pos[i + di, j + dj]])
-    return m, streets
-
-
-def _random_dead_end(rng, base):
-    """Chain of 1-3 segments from ``base``, sometimes with a branch or an end loop."""
-    chain = [base]
-    for _ in range(rng.randint(1, 3)):
-        x, y = chain[-1]
-        chain.append((x + rng.uniform(-20, 20), y + rng.uniform(-20, 20)))
-    lines, nodes = [chain], chain[1:]
-    roll = rng.random()
-    if roll < 0.3:                       # branch off the dead end
-        x, y = rng.choice(chain[1:])
-        branch = [(x, y), (x + rng.uniform(-15, 15), y + rng.uniform(-15, 15))]
-        lines.append(branch)
-        nodes.append(branch[1])
-    elif roll < 0.5:                     # loop at the end of the dead end
-        x, y = chain[-1]
-        a = (x + rng.uniform(5, 15), y + rng.uniform(5, 15))
-        c = (x - rng.uniform(5, 15), y + rng.uniform(5, 15))
-        lines.append([chain[-1], a, c, chain[-1]])
-        nodes += [a, c]
-    return lines, nodes
-
-
-def _random_terminals(rng, mesh, candidates):
-    """1-8 buildings on random candidate nodes, one source on a mesh node."""
-    buildings = []
-    for k in range(rng.randint(1, 8)):
-        x, y = rng.choice(candidates)
-        buildings.append(((x + 3 + 0.01 * k, y + 4), (x, y), rng.uniform(5, 50)))
-    x, y = rng.choice(mesh)
-    return buildings, [((x - 7, y - 3), (x, y))]
-
-
 class TestRandomGraphs:
     @staticmethod
     def _simplify(G, b, s):
@@ -712,7 +586,7 @@ class TestRandomGraphs:
 
     @pytest.mark.parametrize("seed", range(60))
     def test_shortest_paths_unchanged(self, seed):
-        G, b, s = _random_case(seed)
+        G, b, s = random_case(seed)
         net = self._simplify(G, b, s)
         if net is None:
             return
@@ -724,7 +598,7 @@ class TestRandomGraphs:
 
     @pytest.mark.parametrize("seed", range(60))
     def test_structure(self, seed):
-        G, b, s = _random_case(seed)
+        G, b, s = random_case(seed)
         net = self._simplify(G, b, s)
         if net is None:
             return
@@ -735,3 +609,28 @@ class TestRandomGraphs:
             if kind == KIND_JUNCTION:
                 assert H.degree(n) >= 2, n
         assert nx.number_of_selfloops(H) == 0
+
+
+class TestNetworkAccess:
+    def test_building_power_on_nodes(self, ring_case):
+        G, b, s = ring_case
+        net = simplify_network(G, b, s)
+        for key, node in net.building_nodes.items():
+            assert net.graph.nodes[node][POWER] == b.at[key, cols.THERMAL_POWER]
+
+    def test_edge_key_is_orientation_free(self):
+        assert edge_key(7, 3) == edge_key(3, 7) == (3, 7)
+
+    def test_source_node(self, ring_case):
+        G, b, s = ring_case
+        net = simplify_network(G, b, s)
+        assert net.source_node() == net.node_ids[(-10, 0)]
+
+    def test_two_sources_rejected_for_milp(self):
+        G, b, s = street_graph(
+            streets=[[(0, 0), (50, 0), (100, 0)]],
+            buildings=[((50, 10), (50, 0), 10.0)],
+            sources=[((-10, 0), (0, 0)), ((110, 0), (100, 0))],
+        )
+        with pytest.raises(ValueError, match="exactly one heat source"):
+            simplify_network(G, b, s).source_node()
