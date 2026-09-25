@@ -9,7 +9,8 @@ Covers:
 - bridges: detection, fixed flow direction, buildings and power behind
 - total length balance and unchanged shortest paths source → building,
   also on random graphs with dead ends attached to mesh nodes
-- on_unreachable = "warn" | "error"
+- on_unreachable = "warn" | "error", invalid input
+- self-loops from repeated street vertices, edge types as in algorithms/network
 
 The graphs are built with the same functions as ``steps/network.py``.
 """
@@ -35,13 +36,13 @@ from fheat_core.algorithms.network import (
     connect_buildings_to_graph,
     connect_source_to_graph,
 )
+from fheat_core.optimization import HOUSE_CONNECTION, SOURCE_CONNECTION, STREET_PIPE
 from fheat_core.optimization.preprocess import (
     BUILDING_KEY,
     COORD,
     FLOW_FROM,
     FLOW_TO,
     GEOMETRY,
-    HOUSE_CONNECTION,
     IS_BRIDGE,
     KIND,
     KIND_BUILDING,
@@ -49,8 +50,6 @@ from fheat_core.optimization.preprocess import (
     KIND_SOURCE,
     N_BEHIND,
     POWER_BEHIND,
-    SOURCE_CONNECTION,
-    STREET_PIPE,
     simplify_network,
 )
 
@@ -97,8 +96,11 @@ def _length(G):
     return sum(d[cols.LENGTH] for _, _, d in G.edges(data=True))
 
 
-def _assert_length_balance(G, net):
+def _assert_report_balance(G, net):
+    """Counts and lengths in the report match both graphs; removed lengths add up."""
     r = net.report
+    assert (r.nodes_before, r.edges_before) == (G.number_of_nodes(), G.number_of_edges())
+    assert (r.nodes_after, r.edges_after) == (net.graph.number_of_nodes(), net.graph.number_of_edges())
     removed = (
         r.disconnected_length_removed
         + r.dead_end_length_removed
@@ -251,7 +253,7 @@ class TestDeadEnds:
 
     def test_length_balance(self, line_case):
         G, b, s = line_case
-        _assert_length_balance(G, simplify_network(G, b, s))
+        _assert_report_balance(G, simplify_network(G, b, s))
 
     def test_shortest_paths_unchanged(self, line_case):
         G, b, s = line_case
@@ -290,7 +292,7 @@ class TestDeadEnds:
         )
         assert net.report.parallel_length_removed == pytest.approx(100)
         _assert_shortest_paths_unchanged(G, b, s, net)
-        _assert_length_balance(G, net)
+        _assert_report_balance(G, net)
 
 
 class TestMergeChains:
@@ -339,7 +341,7 @@ class TestMergeChains:
     def test_length_balance(self, ring_case):
         G, b, s = ring_case
         net = simplify_network(G, b, s)
-        _assert_length_balance(G, net)
+        _assert_report_balance(G, net)
         assert net.report.length_after == pytest.approx(net.report.length_before)
 
 
@@ -351,7 +353,7 @@ class TestParallelEdges:
         assert net.graph.edges[a, c][cols.LENGTH] == pytest.approx(100)
         assert net.report.parallel_edges_removed == 1
         assert net.report.parallel_length_removed == pytest.approx(200)
-        _assert_length_balance(G, net)
+        _assert_report_balance(G, net)
 
     def test_simple_graph(self, parallel_case):
         G, b, s = parallel_case
@@ -369,7 +371,6 @@ class TestBridges:
     def test_ring_bridges(self, ring_case):
         G, b, s = ring_case
         net = simplify_network(G, b, s)
-        H = net.graph
         bridges = {frozenset((net.node_coords[u], net.node_coords[v])) for u, v in net.bridges()}
         assert bridges == {
             frozenset(((25, -10), (25, 0))),
@@ -465,9 +466,10 @@ class TestUnreachable:
             net = simplify_network(G, b, s)
         assert net.unreachable_buildings == [1]
         assert net.report.unreachable_buildings == 1
+        assert net.report.disconnected_edges_removed == 2
         assert net.report.disconnected_length_removed == pytest.approx(60)
         assert any("cannot be reached" in r.getMessage() for r in caplog.records)
-        _assert_length_balance(G, net)
+        _assert_report_balance(G, net)
 
     def test_warning_names_building_ids(self, caplog):
         G, b, s = _graph(
@@ -501,6 +503,33 @@ class TestUnreachable:
             simplify_network(G, b, s, on_unreachable="ignore")
 
 
+class TestEdgeTypes:
+    def test_values_match_street_graph(self, ring_case):
+        """The constants equal the edge types set by fheat_core.algorithms.network."""
+        G, _, _ = ring_case
+        assert {d[cols.TYPE] for _, _, d in G.edges(data=True)} == {
+            HOUSE_CONNECTION, STREET_PIPE, SOURCE_CONNECTION,
+        }
+
+
+class TestSelfLoops:
+    def test_repeated_street_vertex(self):
+        """A repeated vertex creates a 0 m self-loop in the street graph."""
+        G, b, s = _graph(
+            streets=[[(0, 0), (10, 0), (10, 0), (20, 0)]],
+            buildings=[((20, 10), (20, 0), 10.0)],
+            sources=[((-10, 0), (0, 0))],
+        )
+        assert nx.number_of_selfloops(G) == 1
+        net = simplify_network(G, b, s)
+        assert net.report.self_loops_removed == 1
+        assert net.report.self_loop_length_removed == 0
+        assert nx.number_of_selfloops(net.graph) == 0
+        assert (10, 0) not in {net.node_coords[n] for n in net.graph}
+        _assert_report_balance(G, net)
+        _assert_shortest_paths_unchanged(G, b, s, net)
+
+
 class TestInputErrors:
     def test_duplicate_centroid_raises(self, ring_case):
         G, b, s = ring_case
@@ -513,6 +542,22 @@ class TestInputErrors:
         G, b, _ = ring_case
         s = gpd.GeoDataFrame({"geometry": [Point(999, 999)]}, crs=CRS)
         with pytest.raises(ValueError, match="not connected"):
+            simplify_network(G, b, s)
+
+    def test_source_on_building_raises(self, ring_case):
+        G, b, _ = ring_case
+        s = gpd.GeoDataFrame({"geometry": [b.at[0, cols.CENTROID]]}, crs=CRS)
+        with pytest.raises(ValueError, match="coincides"):
+            simplify_network(G, b, s)
+
+    def test_building_on_street_vertex_raises(self):
+        """A centroid on a street vertex is not a leaf of the graph."""
+        G, b, s = _graph(
+            streets=[[(0, 0), (10, 0), (20, 0)]],
+            buildings=[((10, 0), (10, 0), 10.0)],
+            sources=[((-10, 0), (0, 0))],
+        )
+        with pytest.raises(ValueError, match="exactly one 'Hausanschluss' edge"):
             simplify_network(G, b, s)
 
     def test_empty_source_raises(self, ring_case):
@@ -561,7 +606,7 @@ class TestPipelineGraph:
 
     def test_length_balance(self, pipeline_case):
         G, b, s = pipeline_case
-        _assert_length_balance(G, simplify_network(G, b, s))
+        _assert_report_balance(G, simplify_network(G, b, s))
 
     def test_shortest_paths_unchanged(self, pipeline_case):
         G, b, s = pipeline_case
@@ -595,51 +640,64 @@ def _random_case(seed):
     mesh parts stay without buildings, some buildings end up unreachable.
     """
     rng = random.Random(seed)
+    m, streets = _random_mesh(rng)
+    mesh = sorted({p for line in streets for p in line})
+    if not mesh:
+        return _random_case(seed + 1000)
+    dead_end_nodes = []
+    for _ in range(rng.randint(1, 3 * m)):
+        lines, nodes = _random_dead_end(rng, rng.choice(mesh))
+        streets += lines
+        dead_end_nodes += nodes
+    buildings, sources = _random_terminals(rng, mesh, mesh + dead_end_nodes)
+    return _graph(streets, buildings, sources)
+
+
+def _random_mesh(rng):
+    """m × m grid (50 m, jittered nodes), each grid street kept with 75 %."""
     m = rng.randint(3, 6)
     pos = {
         (i, j): (i * 50 + rng.uniform(-10, 10), j * 50 + rng.uniform(-10, 10))
         for i in range(m) for j in range(m)
     }
     streets = []
-    for i in range(m):
-        for j in range(m):
-            for di, dj in ((1, 0), (0, 1)):
-                if (i + di, j + dj) in pos and rng.random() < 0.75:
-                    streets.append([pos[i, j], pos[i + di, j + dj]])
-    mesh = sorted({p for line in streets for p in line})
-    if not mesh:
-        return _random_case(seed + 1000)
+    for (i, j), p in pos.items():
+        for di, dj in ((1, 0), (0, 1)):
+            if (i + di, j + dj) in pos and rng.random() < 0.75:
+                streets.append([p, pos[i + di, j + dj]])
+    return m, streets
 
-    dead_end_nodes = []
-    for _ in range(rng.randint(1, 3 * m)):
-        base = rng.choice(mesh)
-        chain = [base]
-        for _ in range(rng.randint(1, 3)):
-            x, y = chain[-1]
-            chain.append((x + rng.uniform(-20, 20), y + rng.uniform(-20, 20)))
-        streets.append(chain)
-        dead_end_nodes += chain[1:]
-        roll = rng.random()
-        if roll < 0.3:                       # branch off the dead end
-            x, y = rng.choice(chain[1:])
-            branch = [(x, y), (x + rng.uniform(-15, 15), y + rng.uniform(-15, 15))]
-            streets.append(branch)
-            dead_end_nodes.append(branch[1])
-        elif roll < 0.5:                     # loop at the end of the dead end
-            x, y = chain[-1]
-            a = (x + rng.uniform(5, 15), y + rng.uniform(5, 15))
-            c = (x - rng.uniform(5, 15), y + rng.uniform(5, 15))
-            streets.append([chain[-1], a, c, chain[-1]])
-            dead_end_nodes += [a, c]
 
-    candidates = mesh + dead_end_nodes
+def _random_dead_end(rng, base):
+    """Chain of 1-3 segments from ``base``, sometimes with a branch or an end loop."""
+    chain = [base]
+    for _ in range(rng.randint(1, 3)):
+        x, y = chain[-1]
+        chain.append((x + rng.uniform(-20, 20), y + rng.uniform(-20, 20)))
+    lines, nodes = [chain], chain[1:]
+    roll = rng.random()
+    if roll < 0.3:                       # branch off the dead end
+        x, y = rng.choice(chain[1:])
+        branch = [(x, y), (x + rng.uniform(-15, 15), y + rng.uniform(-15, 15))]
+        lines.append(branch)
+        nodes.append(branch[1])
+    elif roll < 0.5:                     # loop at the end of the dead end
+        x, y = chain[-1]
+        a = (x + rng.uniform(5, 15), y + rng.uniform(5, 15))
+        c = (x - rng.uniform(5, 15), y + rng.uniform(5, 15))
+        lines.append([chain[-1], a, c, chain[-1]])
+        nodes += [a, c]
+    return lines, nodes
+
+
+def _random_terminals(rng, mesh, candidates):
+    """1-8 buildings on random candidate nodes, one source on a mesh node."""
     buildings = []
     for k in range(rng.randint(1, 8)):
         x, y = rng.choice(candidates)
         buildings.append(((x + 3 + 0.01 * k, y + 4), (x, y), rng.uniform(5, 50)))
     x, y = rng.choice(mesh)
-    sources = [((x - 7, y - 3), (x, y))]
-    return _graph(streets, buildings, sources)
+    return buildings, [((x - 7, y - 3), (x, y))]
 
 
 class TestRandomGraphs:
@@ -670,7 +728,7 @@ class TestRandomGraphs:
         net = self._simplify(G, b, s)
         if net is None:
             return
-        _assert_length_balance(G, net)
+        _assert_report_balance(G, net)
         _assert_bridges_match_brute_force(net)
         H = net.graph
         for n, kind in H.nodes(data=KIND):

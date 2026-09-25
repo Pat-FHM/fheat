@@ -4,3 +4,8 @@ Solver-dependent modules import oemof.solph lazily; install the ``[opt]``
 extra to use them. Pre-processing such as :mod:`.linearize` has no extra
 dependencies.
 """
+
+# Edge types (``cols.TYPE``) as set by ``fheat_core.algorithms.network``.
+HOUSE_CONNECTION = "Hausanschluss"
+STREET_PIPE = "Straßenleitung"
+SOURCE_CONNECTION = "Quellenanschluss"

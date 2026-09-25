@@ -1,4 +1,4 @@
-"""Linearisation of pipe costs and heat losses over the transport capacity.
+"""Linearisation of pipe costs and heat losses over the transport capacity (plan section 4).
 
 The MILP only knows a continuous design capacity C_e [kW] per section. Pipe
 costs and heat losses are therefore approximated per edge type by straight
@@ -21,11 +21,9 @@ import numpy as np
 import pandas as pd
 
 from fheat_core.algorithms.network import calculate_glf, calculate_volumeflow
+from fheat_core.optimization import HOUSE_CONNECTION, STREET_PIPE
 
 logger = logging.getLogger(__name__)
-
-HOUSE_CONNECTION = "Hausanschluss"
-STREET_PIPE = "Straßenleitung"
 
 _U_VALUE_COLUMNS = {"standard": "U-Value", "extra": "U-Value_extra_insulation"}
 
@@ -247,7 +245,7 @@ def linearize_pipes(
                 "Linearised %s (%s, %s to %s): slope=%.6g, intercept=%.6g, R²=%.3f, "
                 "deviation per DN: %s",
                 quantity, edge_type, lo, hi, f.slope, f.intercept, f.r_squared,
-                ", ".join(f"{d}: {v:+.1%}" for d, v in zip(f.table["DN"], f.table["deviation"])),
+                ", ".join(f"{d}: {v:+.1%}" for d, v in zip(f.table["DN"], f.table["deviation"], strict=True)),
             )
             if f.max_abs_deviation > max_deviation:
                 worst = f.table.loc[f.table["deviation"].abs().idxmax()]

@@ -20,9 +20,8 @@ import pandas as pd
 import pytest
 
 from fheat_core.algorithms.network import calculate_glf, calculate_volumeflow
+from fheat_core.optimization import HOUSE_CONNECTION, STREET_PIPE
 from fheat_core.optimization.linearize import (
-    HOUSE_CONNECTION,
-    STREET_PIPE,
     fit_linear,
     linearize_pipes,
     merge_pipe_costs,
@@ -56,7 +55,7 @@ def reference(pipe_info, pipe_costs):
 class TestPipeCapacities:
     def test_round_trip_with_volumeflow(self, pipe_info):
         q = pipe_capacities(pipe_info, 70, 50)
-        for q_max, vf_max in zip(q, pipe_info["max_volumeFlow"]):
+        for q_max, vf_max in zip(q, pipe_info["max_volumeFlow"], strict=True):
             assert calculate_volumeflow(q_max, 70, 50) == pytest.approx(vf_max)
 
     def test_monotonically_increasing(self, pipe_info):
@@ -268,7 +267,7 @@ class TestLinearizeWarnings:
 class TestReport:
     def test_report_contains_all_fits(self, reference):
         rep = reference.report()
-        assert set(zip(rep["quantity"], rep["edge_type"])) == {
+        assert set(zip(rep["quantity"], rep["edge_type"], strict=True)) == {
             ("cost", HOUSE_CONNECTION), ("cost", STREET_PIPE),
             ("loss", HOUSE_CONNECTION), ("loss", STREET_PIPE),
         }

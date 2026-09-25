@@ -1,26 +1,31 @@
-"""Graph simplification for the MILP network optimisation.
+"""Graph simplification for the MILP network optimisation (plan section 5).
 
 The street graph of ``steps/network.py`` has one node per street vertex. This
-module turns it into the candidate graph of the MILP:
+module turns it into the candidate graph of the MILP. Numbering as in plan
+section 5:
 
 1. Integer node IDs (Pyomo cannot index by coordinate tuples); the mapping
    ID ↔ coordinate is kept.
-2. Parts of the graph that cannot reach a heat source are removed; their
-   buildings are reported as unreachable.
-3. Dead ends without buildings are removed: every part of the graph that is
-   attached to the rest through a single node and contains neither a building
-   nor a source (dead-end streets, loops hanging off a single junction).
-4. Chains of street nodes with exactly two street edges and no connection are
+2. Parts of the graph that cannot reach a heat source are removed. Dead ends
+   are removed: every part attached to the rest through a single node that
+   contains neither a building nor a source (dead-end streets, loops hanging
+   off a single junction). The connecting node stays as long as the part
+   before it stays.
+3. Chains of street nodes with exactly two street edges and no connection are
    merged into one edge per street section (summed length, joined geometry).
-5. Parallel sections between the same two nodes are reduced to the shortest
-   one (R3); self-loops created by step 4 are removed.
-6. Bridges are identified. For every bridge the side without a source is
+4. Parallel sections between the same two nodes are reduced to the shortest
+   one (R3); self-loops created by step 3 are removed.
+5. Bridges are identified. For every bridge the side without a source is
    known, hence also the flow direction and the buildings behind it. With
    all buildings connected (forced mode) number and power behind a bridge
    are exact; in the economic mode they are only upper bounds, the direction
    stays fixed.
+6. Buildings that cannot be reached from a source are reported
+   (``on_unreachable``); without any reachable building a ``ValueError`` is
+   raised.
+7. Invalid input raises a ``ValueError`` with a clear message.
 
-Steps 3 to 5 do not change the optimum of the MILP: removed parts contain no
+Steps 2 to 4 do not change the optimum of the MILP: removed parts contain no
 building or source, so a cost-minimal tree never uses them, and of two
 parallel sections between the same nodes the shorter one is always cheaper
 (pipe costs and losses scale with the length). Every removed edge is counted
@@ -37,12 +42,9 @@ import networkx as nx
 from shapely.geometry import LineString
 
 from fheat_core import columns as cols
+from fheat_core.optimization import HOUSE_CONNECTION, SOURCE_CONNECTION, STREET_PIPE
 
 logger = logging.getLogger(__name__)
-
-HOUSE_CONNECTION = "Hausanschluss"
-STREET_PIPE = "Straßenleitung"
-SOURCE_CONNECTION = "Quellenanschluss"
 
 # node attributes
 COORD = "coord"
@@ -100,7 +102,7 @@ class SimplifiedNetwork:
 
     ``graph`` has integer nodes with the attributes ``coord``, ``kind`` and
     ``building_key`` / ``source_key``; edges carry ``cols.TYPE``,
-    ``cols.LENGTH``, ``geometry`` and the bridge attributes.
+    ``cols.LENGTH`` [m], ``geometry`` and the bridge attributes.
     ``node_ids`` maps every coordinate of the input graph to its integer ID,
     ``node_coords`` the other way round.
     """
@@ -124,7 +126,7 @@ def simplify_network(
     power_att: str = cols.THERMAL_POWER,
     on_unreachable: str = "warn",
 ) -> SimplifiedNetwork:
-    """Simplify the street graph built by ``steps/network.py``.
+    """Simplify the street graph built by ``steps/network.py`` (plan section 5).
 
     Buildings are identified by their centroid (as in ``compute_network``),
     sources by their point geometry. ``G`` is not modified.
@@ -144,49 +146,22 @@ def simplify_network(
         edges_before=G.number_of_edges(),
         length_before=_total_length(G),
     )
-
-    node_coords = dict(enumerate(G.nodes))
-    node_ids = {coord: i for i, coord in node_coords.items()}
-    H = nx.Graph()
-    for i, coord in node_coords.items():
-        H.add_node(i, **{COORD: coord, KIND: KIND_JUNCTION})
-    for u, v, data in G.edges(data=True):
-        attrs = dict(data)
-        attrs.setdefault(GEOMETRY, LineString([u, v]))
-        H.add_edge(node_ids[u], node_ids[v], **attrs)
-
+    H, node_coords, node_ids = _integer_graph(G)
     building_nodes, power, unreachable = _mark_buildings(H, node_ids, buildings_gdf, power_att)
     source_nodes = _mark_sources(H, node_ids, source_gdf)
 
     _remove_disconnected(H, source_nodes.values(), report)
-    for key, node in list(building_nodes.items()):
-        if node not in H:
-            unreachable.append(key)
-            del building_nodes[key]
-    if unreachable:
-        ids = _building_ids(buildings_gdf, unreachable)
-        msg = f"{len(unreachable)} building(s) cannot be reached from a heat source: {ids}"
-        if on_unreachable == "error":
-            raise ValueError(msg)
-        logger.warning("%s; they are not part of the network.", msg)
-    if not building_nodes:
-        raise ValueError("No building can be reached from a heat source: there is no network to optimise.")
+    unreachable += _drop_removed_buildings(H, building_nodes)
+    _report_unreachable(buildings_gdf, unreachable, len(building_nodes), on_unreachable)
     _check_leaves(H, building_nodes, source_nodes)
 
-    while True:
-        edges = H.number_of_edges()
-        _remove_dead_ends(H, source_nodes.values(), report)
-        H = _merge_chains(H, report)
-        if H.number_of_edges() == edges:
-            break
-
+    H = _reduce_until_stable(H, source_nodes.values(), report)
     _mark_bridges(H, source_nodes, {building_nodes[k]: power[k] for k in building_nodes}, report)
 
     report.nodes_after = H.number_of_nodes()
     report.edges_after = H.number_of_edges()
     report.length_after = _total_length(H)
     report.unreachable_buildings = len(unreachable)
-
     logger.info("Graph simplification: %s", report.as_dict())
 
     return SimplifiedNetwork(
@@ -200,12 +175,37 @@ def simplify_network(
     )
 
 
+def _integer_graph(G):
+    """Copy of ``G`` with integer nodes (step 1); every edge gets a geometry."""
+    node_coords = dict(enumerate(G.nodes))
+    node_ids = {coord: i for i, coord in node_coords.items()}
+    H = nx.Graph()
+    for i, coord in node_coords.items():
+        H.add_node(i, **{COORD: coord, KIND: KIND_JUNCTION})
+    for u, v, data in G.edges(data=True):
+        attrs = dict(data)
+        attrs.setdefault(GEOMETRY, LineString([u, v]))
+        H.add_edge(node_ids[u], node_ids[v], **attrs)
+    return H, node_coords, node_ids
+
+
+def _reduce_until_stable(H, sources, report) -> nx.Graph:
+    """Repeat steps 2 to 4: dropping a parallel edge can create new chains or dead ends."""
+    while True:
+        edges = H.number_of_edges()
+        _remove_dead_ends(H, sources, report)
+        H = _merge_chains(H, report)
+        if H.number_of_edges() == edges:
+            return H
+
+
 # ---------------------------------------------------------------------------
-# terminals
+# terminals (buildings and sources)
 # ---------------------------------------------------------------------------
 
 
 def _mark_buildings(H, node_ids, buildings_gdf, power_att):
+    """Mark building nodes; buildings missing in the graph are unreachable."""
     building_nodes: dict[Hashable, int] = {}
     power: dict[Hashable, float] = {}
     unreachable: list = []
@@ -229,13 +229,6 @@ def _mark_buildings(H, node_ids, buildings_gdf, power_att):
     return building_nodes, power, unreachable
 
 
-def _building_ids(buildings_gdf, keys) -> list:
-    """``building_id`` of the given rows if the column exists, else their index."""
-    if cols.BUILDING_ID in buildings_gdf.columns:
-        return buildings_gdf.loc[keys, cols.BUILDING_ID].tolist()
-    return list(keys)
-
-
 def _mark_sources(H, node_ids, source_gdf):
     source_nodes: dict[Hashable, int] = {}
     for key, row in source_gdf.iterrows():
@@ -251,6 +244,33 @@ def _mark_sources(H, node_ids, source_gdf):
     if not source_nodes:
         raise ValueError("source_gdf is empty: at least one heat source is required.")
     return source_nodes
+
+
+def _drop_removed_buildings(H, building_nodes) -> list:
+    """Remove buildings whose node was removed from ``building_nodes``; return their keys."""
+    removed = [key for key, node in building_nodes.items() if node not in H]
+    for key in removed:
+        del building_nodes[key]
+    return removed
+
+
+def _report_unreachable(buildings_gdf, unreachable, n_reachable, on_unreachable):
+    """Step 6: warn about or refuse unreachable buildings; refuse an empty network."""
+    if unreachable:
+        ids = _building_ids(buildings_gdf, unreachable)
+        msg = f"{len(unreachable)} building(s) cannot be reached from a heat source: {ids}"
+        if on_unreachable == "error":
+            raise ValueError(msg)
+        logger.warning("%s; they are not part of the network.", msg)
+    if n_reachable == 0:
+        raise ValueError("No building can be reached from a heat source: there is no network to optimise.")
+
+
+def _building_ids(buildings_gdf, keys) -> list:
+    """``building_id`` of the given rows if the column exists, else their index."""
+    if cols.BUILDING_ID in buildings_gdf.columns:
+        return buildings_gdf.loc[keys, cols.BUILDING_ID].tolist()
+    return list(keys)
 
 
 def _check_leaves(H, building_nodes, source_nodes):
@@ -269,7 +289,7 @@ def _check_leaves(H, building_nodes, source_nodes):
 
 
 # ---------------------------------------------------------------------------
-# removal steps
+# step 2: parts without source, dead ends
 # ---------------------------------------------------------------------------
 
 
@@ -284,60 +304,93 @@ def _remove_disconnected(H, sources, report):
     H.remove_nodes_from(drop)
 
 
+@dataclass
+class _BlockCutTree:
+    """Blocks (biconnected components) and cut nodes of a graph as a tree.
+
+    Tree nodes are ``("block", index)`` and ``("cut", node)``; a block is
+    linked to every cut node it contains.
+    """
+
+    tree: nx.Graph
+    blocks: list[set]
+    cut_nodes: set
+    block_of: dict      # non-cut node → index of its only block
+
+    @classmethod
+    def of(cls, H) -> _BlockCutTree:
+        cut_nodes = set(nx.articulation_points(H))
+        blocks = [set(b) for b in nx.biconnected_components(H)]
+        tree = nx.Graph()
+        block_of = {}
+        for i, block in enumerate(blocks):
+            tree.add_node(("block", i))
+            block_of.update({n: i for n in block - cut_nodes})
+            tree.add_edges_from((("block", i), ("cut", a)) for a in block & cut_nodes)
+        return cls(tree, blocks, cut_nodes, block_of)
+
+    def tree_node(self, n):
+        """Tree node holding graph node ``n`` (the graph has no isolated nodes)."""
+        return ("cut", n) if n in self.cut_nodes else ("block", self.block_of[n])
+
+    def own_nodes(self, t) -> set:
+        """Graph nodes represented by tree node ``t`` (a block without its cut nodes)."""
+        kind, ref = t
+        return {ref} if kind == "cut" else self.blocks[ref] - self.cut_nodes
+
+
 def _remove_dead_ends(H, sources, report):
     """Remove every part attached through one node without building or source.
 
-    Uses the block-cut tree: rooted at a source, every subtree without a
-    terminal (building or source) is dropped. An articulation point belongs to
-    its parent block as well and is only dropped together with that block.
+    Uses the block-cut tree rooted at a source: every subtree without a
+    terminal (building or source) is dropped.
     """
+    bct = _BlockCutTree.of(H)
     terminals = {n for n, k in H.nodes(data=KIND) if k != KIND_JUNCTION}
-    cut_nodes = set(nx.articulation_points(H))
-    blocks = [set(b) for b in nx.biconnected_components(H)]
-
-    tree = nx.Graph()
-    block_of = {}
-    for i, block in enumerate(blocks):
-        tree.add_node(("block", i))
-        for n in block - cut_nodes:
-            block_of[n] = i
-        for a in block & cut_nodes:
-            tree.add_edge(("block", i), ("cut", a))
-
-    def own_nodes(t):
-        kind, ref = t
-        return {ref} if kind == "cut" else blocks[ref] - cut_nodes
-
-    # every component contains a source (see _remove_disconnected); isolated
-    # sources without edges have no tree node
-    source_tree_nodes = [
-        ("cut", s) if s in cut_nodes else ("block", block_of[s])
-        for s in sources
-        if s in cut_nodes or s in block_of
-    ]
+    # every component contains a source (see _remove_disconnected)
+    roots = [bct.tree_node(s) for s in sources]
     drop = set()
-    for component in nx.connected_components(tree):
-        root = next(t for t in source_tree_nodes if t in component)
-        parent = dict(nx.bfs_predecessors(tree, root))
-        has_terminal = {}
-        for t in nx.dfs_postorder_nodes(tree, root):
-            has_terminal[t] = has_terminal.get(t, False) or bool(own_nodes(t) & terminals)
-            if has_terminal[t] and t in parent:
-                has_terminal[parent[t]] = True
-        for t, keep in has_terminal.items():
-            if keep:
-                continue
-            if t[0] == "block":
-                drop |= own_nodes(t)
-            # a cut node also belongs to its parent block: drop it only with that block
-            elif not has_terminal[parent[t]]:
-                drop.add(t[1])
-    if not drop:
-        return
-    removed = [(u, v, d) for u, v, d in H.edges(drop, data=True)]
+    for component in nx.connected_components(bct.tree):
+        root = next(t for t in roots if t in component)
+        drop |= _dead_end_nodes(bct, root, terminals)
+    removed = list(H.edges(drop, data=True))
     report.dead_end_edges_removed += len(removed)
     report.dead_end_length_removed += sum(d[cols.LENGTH] for _, _, d in removed)
     H.remove_nodes_from(drop)
+
+
+def _dead_end_nodes(bct, root, terminals) -> set:
+    """Graph nodes in subtrees below ``root`` that contain no terminal.
+
+    A cut node also belongs to its parent block and is only dropped together
+    with that block.
+    """
+    parent = dict(nx.bfs_predecessors(bct.tree, root))
+    has_terminal = _terminal_below(bct, root, parent, terminals)
+    drop = set()
+    for t, keep in has_terminal.items():
+        if keep:
+            continue
+        if t[0] == "block":
+            drop |= bct.own_nodes(t)
+        elif not has_terminal[parent[t]]:
+            drop.add(t[1])
+    return drop
+
+
+def _terminal_below(bct, root, parent, terminals) -> dict:
+    """For every tree node below ``root``: does its subtree contain a terminal?"""
+    has_terminal = {}
+    for t in nx.dfs_postorder_nodes(bct.tree, root):
+        has_terminal[t] = has_terminal.get(t, False) or bool(bct.own_nodes(t) & terminals)
+        if has_terminal[t] and t in parent:
+            has_terminal[parent[t]] = True
+    return has_terminal
+
+
+# ---------------------------------------------------------------------------
+# steps 3 and 4: merge chains, parallel sections
+# ---------------------------------------------------------------------------
 
 
 def _is_mergeable(H, n) -> bool:
@@ -347,54 +400,62 @@ def _is_mergeable(H, n) -> bool:
 
 
 def _merge_chains(H, report) -> nx.Graph:
-    """Merge chains of mergeable nodes into one edge; keep the shortest parallel edge."""
+    """New graph with one edge per chain of mergeable nodes (steps 3 and 4).
+
+    Every component contains a source (step 2), which is never mergeable, so
+    every chain starts at a kept node.
+    """
     out = nx.Graph()
     out.add_nodes_from(n for n in H.nodes(data=True) if not _is_mergeable(H, n[0]))
     visited = set()
-
-    def add(u, v, attrs):
-        if u == v:
-            report.self_loops_removed += 1
-            report.self_loop_length_removed += attrs[cols.LENGTH]
-            return
-        if out.has_edge(u, v):
-            report.parallel_edges_removed += 1
-            old = out.edges[u, v]
-            if attrs[cols.LENGTH] < old[cols.LENGTH]:
-                report.parallel_length_removed += old[cols.LENGTH]
-                out.remove_edge(u, v)
-            else:
-                report.parallel_length_removed += attrs[cols.LENGTH]
-                return
-        out.add_edge(u, v, **attrs)
-
     for start in list(out.nodes):
         for nbr in H.neighbors(start):
             if frozenset((start, nbr)) in visited:
                 continue
-            chain = [start, nbr]
-            visited.add(frozenset((start, nbr)))
-            while _is_mergeable(H, chain[-1]):
-                nxt = next(n for n in H.neighbors(chain[-1]) if frozenset((chain[-1], n)) not in visited)
-                visited.add(frozenset((chain[-1], nxt)))
-                chain.append(nxt)
-            add(chain[0], chain[-1], _chain_attrs(H, chain))
+            chain = _walk_chain(H, start, nbr, visited)
+            _add_section(out, chain[0], chain[-1], _chain_attrs(H, chain), report)
             report.nodes_merged += len(chain) - 2
-
-    # edges never reached from a kept node form cycles of mergeable nodes only
-    for u, v, d in H.edges(data=True):
-        if frozenset((u, v)) not in visited:
-            report.self_loops_removed += 1
-            report.self_loop_length_removed += d[cols.LENGTH]
     return out
 
 
+def _walk_chain(H, start, nbr, visited) -> list:
+    """Nodes from ``start`` via ``nbr`` up to the next non-mergeable node."""
+    chain = [start, nbr]
+    visited.add(frozenset((start, nbr)))
+    while _is_mergeable(H, chain[-1]):
+        nxt = next(n for n in H.neighbors(chain[-1]) if frozenset((chain[-1], n)) not in visited)
+        visited.add(frozenset((chain[-1], nxt)))
+        chain.append(nxt)
+    return chain
+
+
+def _add_section(out, u, v, attrs, report):
+    """Add a merged section; drop self-loops, keep the shorter of parallel sections.
+
+    Self-loops come from repeated vertices in a street line (length 0 m).
+    """
+    length = attrs[cols.LENGTH]
+    if u == v:
+        report.self_loops_removed += 1
+        report.self_loop_length_removed += length
+        return
+    if out.has_edge(u, v):
+        old_length = out.edges[u, v][cols.LENGTH]
+        report.parallel_edges_removed += 1
+        report.parallel_length_removed += max(length, old_length)
+        if length >= old_length:
+            return
+        out.remove_edge(u, v)
+    out.add_edge(u, v, **attrs)
+
+
 def _chain_attrs(H, chain) -> dict:
+    """Attributes of the merged section: summed length [m], joined geometry."""
     if len(chain) == 2:
         return dict(H.edges[chain[0], chain[1]])
     coords = [H.nodes[chain[0]][COORD]]
     length = 0.0
-    for u, v in zip(chain[:-1], chain[1:]):
+    for u, v in zip(chain[:-1], chain[1:], strict=True):
         d = H.edges[u, v]
         length += d[cols.LENGTH]
         seg = list(d[GEOMETRY].coords)
@@ -405,8 +466,43 @@ def _chain_attrs(H, chain) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# bridges
+# step 5: bridges
 # ---------------------------------------------------------------------------
+
+
+@dataclass
+class _SubtreeSums:
+    """Per node of a spanning tree rooted at a source: parent and subtree sums.
+
+    ``totals`` holds (buildings, power [kW], sources) of the node's component.
+    """
+
+    parent: dict = field(default_factory=dict)
+    buildings: dict = field(default_factory=dict)
+    power: dict = field(default_factory=dict)
+    sources: dict = field(default_factory=dict)
+    totals: dict = field(default_factory=dict)
+
+    @classmethod
+    def of(cls, H, sources, building_power) -> _SubtreeSums:
+        sums = cls()
+        for component in nx.connected_components(H):
+            root = next(s for s in sources if s in component)
+            sums._add_tree(nx.bfs_tree(H, root), root, sources, building_power)
+            total = (sums.buildings[root], sums.power[root], sums.sources[root])
+            sums.totals.update(dict.fromkeys(component, total))
+        return sums
+
+    def _add_tree(self, tree, root, sources, building_power):
+        for n in nx.dfs_postorder_nodes(tree, root):
+            self.buildings[n] = self.buildings.get(n, 0) + (n in building_power)
+            self.power[n] = self.power.get(n, 0.0) + building_power.get(n, 0.0)
+            self.sources[n] = self.sources.get(n, 0) + (n in sources)
+            for p in tree.predecessors(n):
+                self.parent[n] = p
+                self.buildings[p] = self.buildings.get(p, 0) + self.buildings[n]
+                self.power[p] = self.power.get(p, 0.0) + self.power[n]
+                self.sources[p] = self.sources.get(p, 0) + self.sources[n]
 
 
 def _mark_bridges(H, source_nodes, building_power, report):
@@ -415,45 +511,29 @@ def _mark_bridges(H, source_nodes, building_power, report):
     Uses any spanning tree rooted at a source: removing a bridge (parent,
     child) separates exactly the subtree of ``child`` from the rest.
     """
-    nx.set_edge_attributes(H, False, IS_BRIDGE)
-    nx.set_edge_attributes(H, None, FLOW_FROM)
-    nx.set_edge_attributes(H, None, FLOW_TO)
-    nx.set_edge_attributes(H, None, N_BEHIND)
-    nx.set_edge_attributes(H, None, POWER_BEHIND)
-
-    sources = set(source_nodes.values())
-    parent, n_sub, p_sub, s_sub, totals = {}, {}, {}, {}, {}
-    for component in nx.connected_components(H):
-        root = next(s for s in sources if s in component)
-        tree = nx.bfs_tree(H, root)
-        for n in nx.dfs_postorder_nodes(tree, root):
-            n_sub[n] = n_sub.get(n, 0) + (n in building_power)
-            p_sub[n] = p_sub.get(n, 0.0) + building_power.get(n, 0.0)
-            s_sub[n] = s_sub.get(n, 0) + (n in sources)
-            for p in tree.predecessors(n):
-                parent[n] = p
-                n_sub[p] = n_sub.get(p, 0) + n_sub[n]
-                p_sub[p] = p_sub.get(p, 0.0) + p_sub[n]
-                s_sub[p] = s_sub.get(p, 0) + s_sub[n]
-        totals[root] = (n_sub[root], p_sub[root], s_sub[root])
-        for n in component:
-            totals[n] = totals[root]
-
+    for attr, default in ((IS_BRIDGE, False), (FLOW_FROM, None), (FLOW_TO, None),
+                          (N_BEHIND, None), (POWER_BEHIND, None)):
+        nx.set_edge_attributes(H, default, attr)
+    sums = _SubtreeSums.of(H, set(source_nodes.values()), building_power)
     for u, v in nx.bridges(H):
-        child, par = (v, u) if parent.get(v) == u else (u, v)
-        n_total, p_total, s_total = totals[child]
         d = H.edges[u, v]
         d[IS_BRIDGE] = True
         report.bridges += 1
-        if s_sub[child] == 0:
-            d[FLOW_FROM], d[FLOW_TO] = par, child
-            d[N_BEHIND], d[POWER_BEHIND] = n_sub[child], p_sub[child]
-        elif s_sub[child] == s_total:
-            d[FLOW_FROM], d[FLOW_TO] = child, par
-            d[N_BEHIND], d[POWER_BEHIND] = n_total - n_sub[child], p_total - p_sub[child]
-        else:
-            continue
-        report.bridges_with_fixed_direction += 1
+        child, par = (v, u) if sums.parent.get(v) == u else (u, v)
+        orientation = _bridge_orientation(child, par, sums)
+        if orientation is not None:
+            d[FLOW_FROM], d[FLOW_TO], d[N_BEHIND], d[POWER_BEHIND] = orientation
+            report.bridges_with_fixed_direction += 1
+
+
+def _bridge_orientation(child, par, sums):
+    """(from, to, buildings behind, power behind [kW]), or None with sources on both sides."""
+    n_total, p_total, s_total = sums.totals[child]
+    if sums.sources[child] == 0:
+        return par, child, sums.buildings[child], sums.power[child]
+    if sums.sources[child] == s_total:
+        return child, par, n_total - sums.buildings[child], p_total - sums.power[child]
+    return None
 
 
 def _total_length(G) -> float:
