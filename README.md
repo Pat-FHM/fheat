@@ -135,13 +135,17 @@ What the step does:
 
 1. builds the street graph as the shortest-path step does, then simplifies it
    (integer node IDs, dead ends removed, street chains merged, parallel
-   sections reduced, bridges fixed) without changing the optimum;
+   sections reduced, bridges oriented and, in the forced mode, fixed) without
+   changing the optimum;
 2. linearises pipe cost [€/m] and heat loss [W/m] over the design capacity;
 3. takes the simultaneity factor (GLF) into the route choice:
    `glf_mode="referenz"` uses the exact GLF behind every bridge and the GLF of
    the shortest-path tree elsewhere; `"aus"` sizes without GLF, for comparison;
 4. solves the MILP once; HiGHS stops at the absolute gap `mip_abs_gap` [€/a]
-   or at `time_limit_s`;
+   or at `time_limit_s` (then with the best network found and a warning).
+   Two exact tightenings shorten the solve: a junction forwards heat only if
+   it is fed, and in the economic mode a building that cannot even pay for
+   its own house connection is excluded beforehand;
 5. re-calculates the chosen network with the exact GLF, the real DN
    (`calculate_diameter_velocity_loss`) and the real pipe costs.
 
@@ -175,8 +179,20 @@ put model and post-calculated values side by side:
 The buildings get `connection_status` (`Anschlussstatus`). The result summary
 adds `milp_*` key figures (objective, gap, solve time, producer capacity
 GLF(N) · ΣQ + losses, real and linearised pipe investment and their deviation,
-connected, unreachable and economically unconnected buildings, revenue). `state.optimization_report` holds the full report,
-including the quality of every cost and loss line per DN.
+connected, unreachable and economically unconnected buildings, revenue).
+`state.optimization_report` holds the full report, including the quality of
+every cost and loss line per DN.
+
+**Run time** (HiGHS 1.15, one laptop, forced mode unless noted):
+
+| Network | Solve time |
+|---|---|
+| Burgsteinfurt, 305 buildings, 648 sections after simplification | ≈ 3.5 s |
+| Burgsteinfurt, economic mode at 0.20 / 0.25 €/kWh | ≈ 15–19 s / ≈ 11–15 s |
+| synthetic 8 × 8 street grid with 200 buildings (many meshes) | ≈ 2.5–5 min |
+
+Meshed street networks take longer than tree-like ones; set `time_limit_s`
+accordingly.
 
 **Parameters** (`OptimizationConfig`):
 

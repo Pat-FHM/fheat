@@ -25,11 +25,11 @@ import pandas as pd
 
 from fheat_core import columns as cols
 from fheat_core.config import OptimizationConfig
-from fheat_core.optimization import HOURS_PER_YEAR, MISSING_OPT_EXTRA, MODE_ECONOMIC
+from fheat_core.optimization import HOURS_PER_YEAR, HOUSE_CONNECTION, MISSING_OPT_EXTRA, MODE_ECONOMIC
 from fheat_core.optimization.block import build_network_block
 from fheat_core.optimization.glf_terms import ReferenceTree, glf_estimated, glf_factors, reference_tree
 from fheat_core.optimization.linearize import PipeLinearization
-from fheat_core.optimization.preprocess import SimplifiedNetwork, edge_key
+from fheat_core.optimization.preprocess import POWER, SimplifiedNetwork, edge_key
 
 try:
     import oemof.solph as solph
@@ -70,7 +70,9 @@ class MilpResult:
     (C [kW]), ``cols.THERMAL_POWER`` (S [kW]), ``cols.N_BUILDINGS`` (n),
     ``cols.GLF_MODEL`` (g_e of block.py, (7)), ``cols.GLF_MODEL_ESTIMATED``,
     ``heat_loss`` [kW] and ``cols.INVEST_COST_MODEL`` [€] of the linearised
-    model. ``connected`` lists the building keys with x_k = 1.
+    model. ``connected`` lists the building keys with x_k = 1,
+    ``prefixed_unprofitable`` counts the buildings fixed to x_k = 0 by
+    block.py, (12).
     """
 
     termination: str
@@ -86,6 +88,7 @@ class MilpResult:
     loss_flow: float            # [kW]
     edges: pd.DataFrame
     connected: list
+    prefixed_unprofitable: int
     build_time_s: float
     solve_time_s: float
 
@@ -127,6 +130,7 @@ def solve_network(
     es.add(comp.bus, comp.producer, comp.consumers, comp.losses)
     model = solph.Model(es)
     model.netz = build_network_block(network, linearization, glf, heat_demand, config.mode)
+    prefixed = _fix_unprofitable(model.netz, network, linearization, glf, heat_demand, config)
     _couple(model, comp)
     _add_pipe_annuity(model, pipe_annuity(config))
     abs_gap = _mip_abs_gap(network, linearization, tree, glf, config)
@@ -135,7 +139,7 @@ def solve_network(
     t0 = time.perf_counter()
     results = _run_highs(model, abs_gap, config.time_limit_s)
     solve_time = time.perf_counter() - t0
-    return _result(model, comp, network, glf, results, config, abs_gap, (build_time, solve_time))
+    return _result(model, comp, network, glf, results, config, abs_gap, prefixed, (build_time, solve_time))
 
 
 def _heat_price(config) -> float:
@@ -148,11 +152,43 @@ def pipe_annuity(config) -> float:
     return economics.annuity(1.0, config.lifetime_pipes, config.interest_rate)
 
 
+def _source_ep_costs(config) -> float:
+    """Annuity of the producer investment [€/(kW·a)]."""
+    return economics.annuity(config.source_capex_eur_per_kw, config.lifetime_source, config.interest_rate)
+
+
+def _fix_unprofitable(netz, network, linearization, glf, heat_demand, config) -> int:
+    """block.py, (12): fix x_k = 0 where the revenue cannot pay for the house connection.
+
+    Returns the number of fixed buildings (0 in the forced mode or when a
+    linearised line has a negative slope or intercept).
+    """
+    if config.mode != MODE_ECONOMIC:
+        return 0
+    lines = (linearization.house_cost, linearization.street_cost, linearization.house_loss, linearization.street_loss)
+    if min(min(f.slope, f.intercept) for f in lines) < 0:
+        logger.info("A linearised line has a negative coefficient; buildings are not fixed before the solve.")
+        return 0
+    margin = config.heat_price_eur_per_kwh - config.heat_cost_eur_per_kwh      # [€/kWh]
+    loss_cost = config.heat_cost_eur_per_kwh * HOURS_PER_YEAR + _source_ep_costs(config)   # [€/(kW·a)]
+    annuity = pipe_annuity(config)
+    H = network.graph
+    fixed = 0
+    for key, node in network.building_nodes.items():
+        (street,) = H.neighbors(node)
+        e = edge_key(street, node)
+        length, capacity = H.edges[e][cols.LENGTH], glf[e] * H.nodes[node][POWER]
+        house = annuity * linearization.invest_cost(HOUSE_CONNECTION, length, capacity, 1)
+        house += linearization.heat_loss(HOUSE_CONNECTION, length, capacity, 1) * loss_cost
+        if margin * heat_demand[key] < house:
+            netz.connected[node].fix(0)
+            fixed += 1
+    return fixed
+
+
 def _components(config) -> _Components:
     bus = solph.Bus(label="waermenetz")
-    source_ep_costs = economics.annuity(
-        config.source_capex_eur_per_kw, config.lifetime_source, config.interest_rate
-    )
+    source_ep_costs = _source_ep_costs(config)
     producer = solph.components.Source(
         label="erzeuger",
         outputs={bus: solph.Flow(
@@ -222,7 +258,8 @@ def _run_highs(model, abs_gap, time_limit_s):
     return results
 
 
-def _result(model, comp, network, glf, results, config, abs_gap, run_times) -> MilpResult:
+def _result(model, comp, network, glf, results, config, abs_gap, prefixed, run_times) -> MilpResult:
+    """Solution values: objective parts [€/a], flows [kW], edge table, run times [s]."""
     netz = model.netz
     heat_cost = config.heat_cost_eur_per_kwh * HOURS_PER_YEAR
     invest = model.InvestmentFlowBlock.invest[comp.producer, comp.bus, 0]
@@ -250,12 +287,14 @@ def _result(model, comp, network, glf, results, config, abs_gap, run_times) -> M
         loss_flow=loss_flow,
         edges=_edge_table(netz, network, glf, glf_estimated(network, config.glf_mode, config.mode)),
         connected=[k for k, n in network.building_nodes.items() if po.value(netz.connected[n]) > 0.5],
+        prefixed_unprofitable=prefixed,
         build_time_s=run_times[0],
         solve_time_s=run_times[1],
     )
 
 
 def _edge_table(netz, network, glf, estimated) -> pd.DataFrame:
+    """One row per section with its built direction and model values (see ``MilpResult``)."""
     built_arc = {edge_key(*a): a for a in netz.ARCS if po.value(netz.direction[a]) > 0.5}
     rows = []
     for u, v, data in network.graph.edges(data=True):

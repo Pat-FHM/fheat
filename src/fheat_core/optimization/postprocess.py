@@ -126,6 +126,7 @@ def _section(row, network, lin, pipe_info, catalogue, pipe_annuity) -> dict:
 
 
 def _flow_geometry(network, row) -> LineString:
+    """Section geometry pointing from ``flow_from`` to ``flow_to``."""
     geometry = network.graph.edges[row["u"], row["v"]][GEOMETRY]
     if geometry.coords[0] != network.node_coords[row["flow_from"]]:
         return LineString(list(geometry.coords)[::-1])
@@ -133,6 +134,7 @@ def _flow_geometry(network, row) -> LineString:
 
 
 def _totals(net_gdf, rows) -> PostCalculation:
+    """Sums [kW, €, €/a] and the largest model deviations over the built sections."""
     if net_gdf.empty:
         return PostCalculation(0.0, 0.0, 0.0, 0.0, 0.0, None, 0, None, 0)
     loss_kw = net_gdf[cols.HEAT_LOSS].sum() / HOURS_PER_YEAR

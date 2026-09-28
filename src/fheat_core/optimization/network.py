@@ -62,6 +62,7 @@ class OptimizationReport:
             "milp_connected_buildings": len(m.connected),
             "milp_unreachable_buildings": len(self.unreachable),
             "milp_not_connected_economic": len(self.not_connected_economic),
+            "milp_prefixed_unprofitable": m.prefixed_unprofitable,
             "milp_producer_capacity_kw": round(p.producer_capacity, 1),
             "milp_producer_capacity_model_kw": round(m.source_capacity, 1),
             "milp_pipe_invest_eur": round(p.invest_cost, 0),

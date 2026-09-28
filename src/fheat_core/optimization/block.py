@@ -48,6 +48,20 @@ Coupling with the oemof system (``energysystem``, one time step of 8760 h)
          losses = Σ_e loss_e [kW].
     (10) P ≥ C_(source connection) + Σ_e loss_e [kW], P the producer capacity.
 
+Tightening without new variables (both keep the optimum)
+    (11) λ_jl ≤ Σ_{i→j ∈ A} λ_ij for j ∈ J and j→l ∈ A: a junction forwards
+         heat only if it is fed. Every feasible solution satisfies it by (4)
+         and (6); it tightens the LP relaxation and shortens the solve.
+    (12) Economic mode, before the solve: x_k = 0 if
+         (p − c) · W_k < an · L_k · (a_K · C_k + b_K)
+                         + (a_V · C_k + b_V) · L_k / 1000 · (c · 8760 + ep)
+         with L_k, C_k = g_k · Q_k the length and capacity of the house
+         connection of k. The revenue then does not even pay for the own house
+         connection; removing k from any solution saves at least that much,
+         because no other cost term grows. This needs non-negative slopes and
+         intercepts of all linearised lines; otherwise (12) is skipped. Applied
+         by ``energysystem``.
+
 Objective [€/a]
     min  ep · P + c · 8760 · F + an · Σ_e L_e · (a_K · C_e + b_K · y_e)
          − p · Σ_k W_k · x_k            (revenue, economic mode only)
@@ -223,7 +237,8 @@ def _add_variables(b, sets):
 
 
 def _add_direction_constraints(b, sets):
-    """Constraints (1) to (3)."""
+    """Constraints (1) to (3) and (11)."""
+    junctions = set(sets.junctions)
     def one_direction(b, u, v):
         if (u, v) in sets.fixed_edges:
             return po.Constraint.Skip
@@ -239,9 +254,16 @@ def _add_direction_constraints(b, sets):
             return po.Constraint.Skip   # λ and x are both fixed to 1
         return sum(b.direction[a] for a in sets.arcs_in[k]) == b.connected[k]
 
+    def forward_with_feed(b, i, j):
+        feeds = [b.direction[a] for a in sets.arcs_in[i]]
+        if i not in junctions or all(v.fixed for v in [b.direction[i, j], *feeds]):
+            return po.Constraint.Skip
+        return b.direction[i, j] <= sum(feeds)
+
     b.one_direction = po.Constraint(b.EDGES, rule=one_direction)
     b.radial = po.Constraint(sets.junctions, rule=radial)
     b.house_connection = po.Constraint(list(sets.building_power), rule=house_connection)
+    b.forward_with_feed = po.Constraint(b.ARCS, rule=forward_with_feed)
 
 
 def _add_flow_constraints(b, sets):

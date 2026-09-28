@@ -13,6 +13,9 @@ Covers:
   GLF and a shared trunk with GLF (variant B)
 - economic mode: the tree supplies exactly the connected buildings, revenue
   in the objective, T9 a far, small building stays unconnected
+- block.py, (11) and (12): same optimum with and without on random networks
+- T10 runtime: 8 × 8 grid with 200 buildings, 60 s limit, not worse than the
+  shortest-path tree evaluated in the same model
 - objective terms, fixed bridges, mip_abs_gap "auto" (only absolute gap),
   time limit, errors
 """
@@ -41,13 +44,14 @@ from fheat_core.optimization import (  # noqa: E402
     HOUSE_CONNECTION,
     MODE_ECONOMIC,
 )
+from fheat_core.optimization import energysystem  # noqa: E402
 from fheat_core.optimization.energysystem import (  # noqa: E402
     MIP_ABS_GAP_AUTO_SHARE,
     solve_network,
 )
 from fheat_core.optimization.glf_terms import design_loads, glf_factors, reference_tree  # noqa: E402
 from fheat_core.optimization.linearize import linearize_pipes  # noqa: E402
-from fheat_core.optimization.preprocess import POWER, simplify_network  # noqa: E402
+from fheat_core.optimization.preprocess import POWER, edge_key, simplify_network  # noqa: E402
 from fheat_core.resources import load_pipe_costs, load_pipe_info  # noqa: E402
 
 from tests.optimization_graphs import grid_case, random_case, street_graph, two_cluster_case  # noqa: E402
@@ -56,11 +60,13 @@ FULL_LOAD_HOURS = 2000.0
 HTEMP, LTEMP = 80.0, 50.0
 
 
-def _solve(G, b, s, htemp=HTEMP, ltemp=LTEMP, **config):
+def _solve(G, b, s, htemp=HTEMP, ltemp=LTEMP, demand=None, **config):
+    """Solve with W_k = Q_k · FULL_LOAD_HOURS unless ``demand`` [kWh/a] is given."""
     cfg = OptimizationConfig(**config)
     net = simplify_network(G, b, s)
     lin = linearize_pipes(load_pipe_info(), load_pipe_costs(), design_loads(net), htemp, ltemp)
-    demand = {k: b.at[k, cols.THERMAL_POWER] * FULL_LOAD_HOURS for k in b.index}
+    if demand is None:
+        demand = {k: b.at[k, cols.THERMAL_POWER] * FULL_LOAD_HOURS for k in b.index}
     return net, lin, solve_network(net, lin, demand, cfg)
 
 
@@ -389,3 +395,121 @@ class TestEconomicRandomNetworks:
         _, _, economic = _economic(G, b, s)
         forced_with_revenue = forced.objective - PRICE * HOURS_PER_YEAR * forced.demand_flow
         assert economic.objective <= forced_with_revenue + economic.mip_abs_gap + 1e-6
+
+
+# ---------------------------------------------------------------------------
+# block.py, (11) and (12): exact tightening, same optimum with and without
+# ---------------------------------------------------------------------------
+
+EXACT = {"mip_abs_gap": 0.0}
+ECONOMIC = {"mode": MODE_ECONOMIC, "heat_price_eur_per_kwh": 0.20}
+
+
+def _mixed_grid(seed):
+    """3 × 3 grid with 30 random buildings; every second one has a tiny annual demand."""
+    G, b, s = grid_case(3, 30, seed=seed)
+    demand = {
+        k: b.at[k, cols.THERMAL_POWER] * (FULL_LOAD_HOURS if i % 2 == 0 else 20.0)
+        for i, k in enumerate(b.index)
+    }
+    return G, b, s, demand
+
+
+def _without_forward_with_feed(monkeypatch):
+    build = energysystem.build_network_block
+
+    def without(*args):
+        block = build(*args)
+        block.del_component(block.forward_with_feed)
+        return block
+
+    monkeypatch.setattr(energysystem, "build_network_block", without)
+
+
+class TestForwardWithFeed:
+    """(11) λ_jl ≤ Σ_i λ_ij cuts off no feasible solution."""
+
+    @pytest.mark.parametrize("seed", range(6))
+    def test_same_forced_optimum(self, seed, monkeypatch):
+        G, b, s = random_case(seed)
+        _, _, tight = _solve(G, b, s, **EXACT)
+        _without_forward_with_feed(monkeypatch)
+        _, _, loose = _solve(G, b, s, **EXACT)
+        assert tight.objective == pytest.approx(loose.objective, rel=1e-7, abs=1e-3)
+
+    @pytest.mark.parametrize("seed", [1, 2, 3])
+    def test_same_economic_optimum(self, seed, monkeypatch):
+        G, b, s, demand = _mixed_grid(seed)
+        _, _, tight = _solve(G, b, s, demand=demand, **EXACT, **ECONOMIC)
+        _without_forward_with_feed(monkeypatch)
+        _, _, loose = _solve(G, b, s, demand=demand, **EXACT, **ECONOMIC)
+        assert tight.objective == pytest.approx(loose.objective, rel=1e-7, abs=1e-3)
+        assert tight.connected
+
+
+class TestUnprofitablePrefixing:
+    """(12) fixes x_k = 0 only where k cannot pay for its own house connection."""
+
+    @pytest.mark.parametrize("seed", [1, 2, 3])
+    def test_same_economic_optimum(self, seed, monkeypatch):
+        G, b, s, demand = _mixed_grid(seed)
+        _, _, fixed = _solve(G, b, s, demand=demand, **EXACT, **ECONOMIC)
+        assert fixed.prefixed_unprofitable > 0 and fixed.connected
+        monkeypatch.setattr(energysystem, "_fix_unprofitable", lambda *args: 0)
+        _, _, free = _solve(G, b, s, demand=demand, **EXACT, **ECONOMIC)
+        assert fixed.objective == pytest.approx(free.objective, rel=1e-7, abs=1e-3)
+        assert set(fixed.connected) == set(free.connected)
+
+    def test_not_in_forced_mode(self):
+        G, b, s, demand = _mixed_grid(1)
+        _, _, res = _solve(G, b, s, demand=demand)
+        assert res.prefixed_unprofitable == 0
+        assert len(res.connected) == len(b)
+
+    def test_skipped_with_a_negative_line(self, monkeypatch):
+        """With a negative slope removing a building could raise a cost: no pre-fixing."""
+        from dataclasses import replace
+
+        G, b, s, demand = _mixed_grid(1)
+        net = simplify_network(G, b, s)
+        lin = linearize_pipes(load_pipe_info(), load_pipe_costs(), design_loads(net), HTEMP, LTEMP)
+        lin = replace(lin, street_loss=replace(lin.street_loss, slope=-1e-6))
+        res = solve_network(net, lin, demand, OptimizationConfig(**ECONOMIC))
+        assert res.prefixed_unprofitable == 0
+
+
+# ---------------------------------------------------------------------------
+# T10 runtime
+# ---------------------------------------------------------------------------
+
+
+def _fix_to_shortest_path_tree(monkeypatch):
+    """Evaluate the shortest-path tree in the same model: fix y and λ to it."""
+    build = energysystem.build_network_block
+
+    def fixed(network, *args):
+        block = build(network, *args)
+        paths = nx.single_source_dijkstra_path(network.graph, network.source_node(), weight=cols.LENGTH)
+        arcs = {(p[i], p[i + 1]) for k in network.building_nodes.values() for p in [paths[k]] for i in range(len(p) - 1)}
+        tree = {edge_key(*a) for a in arcs}
+        for e in block.EDGES:
+            block.built[e].fix(1 if e in tree else 0)
+        for a in block.ARCS:
+            block.direction[a].fix(1 if a in arcs else 0)
+        return block
+
+    monkeypatch.setattr(energysystem, "build_network_block", fixed)
+
+
+@pytest.mark.slow
+def test_t10_grid_8x8_within_time_limit(monkeypatch):
+    G, b, s = grid_case(8, 200, seed=1)
+    _, _, res = _solve(G, b, s, time_limit_s=60.0)
+    assert res.solve_time_s <= 70.0
+    assert res.termination in {"optimal", "maxTimeLimit"}
+    assert nx.is_arborescence(_built_tree(res))
+    _fix_to_shortest_path_tree(monkeypatch)
+    _, _, reference = _solve(G, b, s, time_limit_s=60.0)
+    assert reference.termination == "optimal"
+    assert res.objective <= reference.objective + 1e-6
+
