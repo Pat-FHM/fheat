@@ -32,7 +32,18 @@ from fheat_core.algorithms.network import (
     calculate_glf,
     calculate_volumeflow,
 )
-from fheat_core.network.base import NetworkBackend, NetworkBackendError
+from fheat_core.network.base import (
+    EMPTY_NETWORK,
+    NO_OPTIMAL_SOLUTION,
+    NO_ROUTABLE_STREETS,
+    SOLVER_UNAVAILABLE,
+    SOURCE_ON_STREET,
+    TIME_LIMIT,
+    TOPOTHERM_UNAVAILABLE,
+    UNMATCHED_NODES,
+    NetworkBackend,
+    NetworkBackendError,
+)
 from fheat_core.resources import resolve_pipe_info
 
 logger = logging.getLogger(__name__)
@@ -61,11 +72,13 @@ def _require_topotherm():
             "topotherm 0.6.0 cannot be imported on this Python version "
             f"({exc}). The expert mode requires Python 3.12 — 3.10/3.11 hit "
             "this SyntaxError, and topotherm's own requires-python bound "
-            '("<=3.13") excludes 3.13.1 and newer. ' + _INSTALL_HINT
+            '("<=3.13") excludes 3.13.1 and newer. ' + _INSTALL_HINT,
+            code=TOPOTHERM_UNAVAILABLE,
         ) from exc
     except ImportError as exc:
         raise NetworkBackendError(
-            "The expert mode requires topotherm. " + _INSTALL_HINT
+            "The expert mode requires topotherm. " + _INSTALL_HINT,
+            code=TOPOTHERM_UNAVAILABLE,
         ) from exc
     import topotherm as tt
 
@@ -155,7 +168,9 @@ class TopothermBackend(NetworkBackend):
         if cols.ROUTABLE in streets.columns:
             streets = streets[streets[cols.ROUTABLE] == 1]
         if streets.empty:
-            raise NetworkBackendError("No routable streets left for the expert mode.")
+            raise NetworkBackendError(
+                "No routable streets left for the expert mode.", code=NO_ROUTABLE_STREETS
+            )
 
         sinks = gpd.GeoDataFrame(
             {
@@ -178,7 +193,8 @@ class TopothermBackend(NetworkBackend):
             raise NetworkBackendError(
                 "The heat source lies exactly on the street network. topotherm "
                 "cannot resolve the resulting duplicate node. Move the source "
-                f"point at least {_MIN_SOURCE_OFFSET} m off the street geometry."
+                f"point at least {_MIN_SOURCE_OFFSET} m off the street geometry.",
+                code=SOURCE_ON_STREET,
             )
         return sinks, roads, srcs
 
@@ -198,7 +214,8 @@ class TopothermBackend(NetworkBackend):
             raise NetworkBackendError(
                 f"{unmatched} edge endpoints could not be matched to a node. "
                 "This usually means duplicate or coincident geometries in the "
-                "street/source input."
+                "street/source input.",
+                code=UNMATCHED_NODES,
             )
         # topotherm drops duplicate candidate edges here; the gdf_edges it
         # returns stays aligned with the matrices: mat["l_i"][k] and column k
@@ -300,7 +317,8 @@ class TopothermBackend(NetworkBackend):
         if not opt.available(False):
             raise NetworkBackendError(
                 f"Solver '{tcfg.solver}' is not available. Install a MILP solver, "
-                "e.g. `pip install highspy` for the open-source HiGHS solver."
+                "e.g. `pip install highspy` for the open-source HiGHS solver.",
+                code=SOLVER_UNAVAILABLE,
             )
         opt.options["mipgap"] = settings.solver.mip_gap
         opt.options["timelimit"] = settings.solver.time_limit
@@ -308,7 +326,8 @@ class TopothermBackend(NetworkBackend):
 
         cond = result.solver.termination_condition
         if cond != pyo.TerminationCondition.optimal:
-            raise NetworkBackendError(f"topotherm optimisation failed: {cond}")
+            code = TIME_LIMIT if cond == pyo.TerminationCondition.maxTimeLimit else NO_OPTIMAL_SOLUTION
+            raise NetworkBackendError(f"topotherm optimisation failed: {cond}", code=code)
 
         try:
             opt_mats = tt.postprocessing.sts(model=model, matrices=mat, settings=settings)
@@ -316,13 +335,15 @@ class TopothermBackend(NetworkBackend):
             raise NetworkBackendError(
                 "topotherm built an empty network — in 'economic' mode no "
                 "connection was profitable. Raise `heat_price`, lower "
-                "`source_price`/`pipes_c_irr`, or use optimization_mode='forced'."
+                "`source_price`/`pipes_c_irr`, or use optimization_mode='forced'.",
+                code=EMPTY_NETWORK,
             ) from exc
         if np.asarray(opt_mats["p"]).size == 0 or np.asarray(opt_mats["q_c"]).size == 0:
             raise NetworkBackendError(
                 "topotherm built an empty network — in 'economic' mode no "
                 "connection was profitable. Raise `heat_price`, lower "
-                "`source_price`/`pipes_c_irr`, or use optimization_mode='forced'."
+                "`source_price`/`pipes_c_irr`, or use optimization_mode='forced'.",
+                code=EMPTY_NETWORK,
             )
         return model, opt_mats
 
@@ -439,7 +460,8 @@ class TopothermBackend(NetworkBackend):
         connected_pts = nodes_df.loc[nodes_df["type_"] == "sink", ["x", "y"]].to_numpy(float)
         if connected_pts.size == 0:
             raise NetworkBackendError(
-                "topotherm built an empty network — no building was connected."
+                "topotherm built an empty network — no building was connected.",
+                code=EMPTY_NETWORK,
             )
         centroids = np.column_stack(
             [buildings.geometry.centroid.x.values, buildings.geometry.centroid.y.values]
